@@ -1,4 +1,5 @@
-import json
+from io import BytesIO
+from pathlib import Path
 from typing import Optional
 
 import numpy as np
@@ -7,7 +8,6 @@ import plotly.express as px
 import plotly.graph_objects as go
 import streamlit as st
 
-
 st.set_page_config(
     page_title="Punjab Startup Dashboard",
     page_icon="",
@@ -15,17 +15,12 @@ st.set_page_config(
     initial_sidebar_state="expanded",
 )
 
-
 CUSTOM_CSS = """
 <style>
 :root {
     --blue-900: #103a71;
     --blue-800: #1d4f91;
     --blue-700: #316fc2;
-    --blue-100: #eff6ff;
-    --blue-050: #f8fbff;
-    --white: #ffffff;
-    --slate: #5b677a;
 }
 .main {
     background: linear-gradient(180deg, #fbfdff 0%, #f2f7ff 100%);
@@ -77,57 +72,56 @@ h1, h2, h3 {
 st.markdown(CUSTOM_CSS, unsafe_allow_html=True)
 
 
-# -----------------------------
-# File loading / cleaning
-# -----------------------------
-def load_data(path: str) -> pd.DataFrame:
-    lower = path.lower()
-    if lower.endswith(".csv"):
-        return pd.read_csv(path, low_memory=False)
-    if lower.endswith((".xlsx", ".xls")):
-        return pd.read_excel(path)
-    raise ValueError("students.csv must be a CSV or Excel file.")
+def read_uploaded_or_local(uploaded_file) -> tuple[pd.DataFrame, str]:
+    if uploaded_file is not None:
+        name = uploaded_file.name.lower()
+        data = uploaded_file.getvalue()
+        if name.endswith(".csv"):
+            return pd.read_csv(BytesIO(data), low_memory=False), uploaded_file.name
+        if name.endswith((".xlsx", ".xls")):
+            return pd.read_excel(BytesIO(data)), uploaded_file.name
+        raise ValueError("Please upload a CSV or Excel file.")
+
+    for candidate in [Path("students.csv"), Path("data/students.csv"), Path("students.xlsx"), Path("data/students.xlsx")]:
+        if candidate.exists():
+            if candidate.suffix.lower() == ".csv":
+                return pd.read_csv(candidate, low_memory=False), candidate.as_posix()
+            return pd.read_excel(candidate), candidate.as_posix()
+
+    raise FileNotFoundError("No local students file found. Upload a CSV/Excel file from the sidebar.")
 
 
 def clean_text_value(series: pd.Series) -> pd.Series:
-    cleaned = (
+    return (
         series.astype("string")
         .str.strip()
-        .replace({"": pd.NA, "nan": pd.NA, "None": pd.NA, "NaN": pd.NA})
+        .replace({"": pd.NA, "nan": pd.NA, "None": pd.NA, "NaN": pd.NA, "<NA>": pd.NA})
     )
-    return cleaned
 
 
 def clean_dataframe(df: pd.DataFrame) -> pd.DataFrame:
     out = df.copy()
     out.columns = [str(c).strip() for c in out.columns]
 
-    text_cols = [
-        "Name", "Roll Number", "Email ID", "Phone Number", "College Name", "University Name",
-        "Faculty Name", "Track Name", "Term", "Business Name", "Business Category",
-        "Term 1 Final Grade"
-    ]
-    for col in text_cols:
-        if col in out.columns:
-            out[col] = clean_text_value(out[col])
+    for col in out.columns:
+        if pd.api.types.is_object_dtype(out[col]) or pd.api.types.is_string_dtype(out[col]):
+            out[col] = out[col].replace({np.inf: np.nan, -np.inf: np.nan})
 
-    numeric_cols = [
-        "No of track tried", "Activities completed", "Tasks completed",
-        "Term 1 Milestone Completed", "Term 2 Milestone Completed", "Term 3 Milestone Completed",
-        "Term 4 Milestone Completed", "Term 5 Milestone Completed", "Term 6 Milestone Completed",
-        "Term 7 Milestone Completed", "Term 8 Milestone Completed", "Term 9 Milestone Completed",
-        "Term 10 Milestone Completed", "Points", "Badges", "Revenue", "No of sales",
+    likely_date_cols = [
+        "Date of sign up start", "Student Created At", "Date of activation", "Last active date"
+    ]
+    for col in likely_date_cols:
+        if col in out.columns:
+            out[col] = pd.to_datetime(out[col], errors="coerce")
+
+    numeric_hints = [
+        "Activities completed", "Tasks completed", "Points", "Badges", "Revenue", "No of sales",
         "No of offerings", "Final Activity Score", "Final Point Score", "Final Revenue Score",
-        "Term 1 Final Score"
+        "Term 1 Final Score", "No of track tried"
     ]
+    numeric_cols = [c for c in out.columns if c in numeric_hints or (str(c).startswith("Term ") and "Milestone Completed" in str(c))]
     for col in numeric_cols:
-        if col in out.columns:
-            out[col] = pd.to_numeric(out[col], errors="coerce")
-
-    date_cols = ["Date of sign up start", "Student Created At", "Date of activation", "Last active date"]
-    for col in date_cols:
-        if col in out.columns:
-            out[col] = pd.to_datetime(out[col], errors="coerce", utc=False)
+        out[col] = pd.to_numeric(out[col], errors="coerce")
 
     return out
 
@@ -155,19 +149,10 @@ def sanitize_for_display(df: pd.DataFrame, max_rows: Optional[int] = None) -> pd
     for col in out.columns:
         if pd.api.types.is_datetime64_any_dtype(out[col]):
             out[col] = out[col].dt.strftime("%Y-%m-%d")
-        elif pd.api.types.is_object_dtype(out[col]) or pd.api.types.is_string_dtype(out[col]):
-            def _convert(v):
-                if pd.isna(v):
-                    return None
-                if isinstance(v, (list, tuple, dict, set)):
-                    try:
-                        return json.dumps(list(v) if isinstance(v, set) else v, ensure_ascii=False)
-                    except Exception:
-                        return str(v)
-                return str(v)
-            out[col] = out[col].map(_convert)
         elif pd.api.types.is_float_dtype(out[col]):
             out[col] = out[col].replace([np.inf, -np.inf], np.nan)
+        else:
+            out[col] = out[col].astype("string")
     return out
 
 
@@ -180,8 +165,8 @@ def safe_dataframe(df: pd.DataFrame, height: int = 420, max_rows: Optional[int] 
     )
 
 
-def plot_bar(df_plot: pd.DataFrame, x: str, y: str, title: str, color: Optional[str] = None, height: int = 430):
-    fig = px.bar(df_plot, x=x, y=y, color=color, text=y, title=title)
+def plot_bar(df_plot: pd.DataFrame, x: str, y: str, title: str, height: int = 430):
+    fig = px.bar(df_plot, x=x, y=y, text=y, title=title)
     fig.update_layout(
         paper_bgcolor="white",
         plot_bgcolor="white",
@@ -215,21 +200,19 @@ def faculty_missing_mask(series: pd.Series) -> pd.Series:
     return cleaned.isna() | cleaned.str.lower().isin(["n/a", "na", "not assigned", "none"])
 
 
-# -----------------------------
-# Metrics / logic
-# -----------------------------
 def build_summary_metrics(df: pd.DataFrame):
     total = len(df)
+    idx = df.index
 
-    term_cols = [c for c in df.columns if c.startswith("Term ") and c.endswith("Milestone Completed")]
-    activities = df["Activities completed"].fillna(0) if "Activities completed" in df.columns else pd.Series(0, index=df.index)
-    tasks = df["Tasks completed"].fillna(0) if "Tasks completed" in df.columns else pd.Series(0, index=df.index)
-    term1 = df["Term 1 Milestone Completed"].fillna(0) if "Term 1 Milestone Completed" in df.columns else pd.Series(0, index=df.index)
-    term2 = df["Term 2 Milestone Completed"].fillna(0) if "Term 2 Milestone Completed" in df.columns else pd.Series(0, index=df.index)
-    activation = df["Date of activation"] if "Date of activation" in df.columns else pd.Series(pd.NaT, index=df.index)
-    last_active = df["Last active date"] if "Last active date" in df.columns else pd.Series(pd.NaT, index=df.index)
+    term_cols = [c for c in df.columns if str(c).startswith("Term ") and str(c).endswith("Milestone Completed")]
+    activities = df["Activities completed"].fillna(0) if "Activities completed" in df.columns else pd.Series(0, index=idx)
+    tasks = df["Tasks completed"].fillna(0) if "Tasks completed" in df.columns else pd.Series(0, index=idx)
+    term1 = df["Term 1 Milestone Completed"].fillna(0) if "Term 1 Milestone Completed" in df.columns else pd.Series(0, index=idx)
+    term2 = df["Term 2 Milestone Completed"].fillna(0) if "Term 2 Milestone Completed" in df.columns else pd.Series(0, index=idx)
+    activation = df["Date of activation"] if "Date of activation" in df.columns else pd.Series(pd.NaT, index=idx)
+    last_active = df["Last active date"] if "Last active date" in df.columns else pd.Series(pd.NaT, index=idx)
 
-    milestone_any = pd.Series(False, index=df.index)
+    milestone_any = pd.Series(False, index=idx)
     if term_cols:
         milestone_any = df[term_cols].fillna(0).gt(0).any(axis=1)
 
@@ -238,30 +221,32 @@ def build_summary_metrics(df: pd.DataFrame):
 
     engagement_any = (activities > 0) | (tasks > 0) | milestone_any
     ever_activated = activation.notna()
-    did_not_start = (~engagement_any) & activation.isna() & last_active.isna()
     active_last_6m = ever_activated & last_active.notna() & (last_active >= six_month_cutoff)
+    did_not_start = (~engagement_any) & activation.isna() & last_active.isna()
     term1_done_not_term2 = (term1 > 0) & (term2 <= 0)
     inactive_since_term1 = term1_done_not_term2 & (~active_last_6m)
 
     metrics = {
         "Total Students": total,
-        "% Completed Milestones": round(pct(milestone_any.sum(), total), 2),
-        "% Didn’t Start": round(pct(did_not_start.sum(), total), 2),
-        "% Active in Last 6 Months": round(pct(active_last_6m.sum(), total), 2),
-        "% Did Term 1 but Not Active in Term 2": round(pct(inactive_since_term1.sum(), total), 2),
+        "% Completed Milestones": round(pct(float(milestone_any.sum()), total), 2),
+        "% Didn’t Start": round(pct(float(did_not_start.sum()), total), 2),
+        "% Active in Last 6 Months": round(pct(float(active_last_6m.sum()), total), 2),
+        "% Did Term 1 but Not Active in Term 2": round(pct(float(inactive_since_term1.sum()), total), 2),
         "Activity Cutoff": six_month_cutoff.strftime("%d %b %Y"),
         "Latest Last Active Date": last_active.max().strftime("%d %b %Y") if last_active.notna().any() else "N/A",
     }
 
-    flags = pd.DataFrame({
-        "Completed Milestones": milestone_any,
-        "Did Not Start": did_not_start,
-        "Active Last 6 Months": active_last_6m,
-        "Did Term 1, Not Active in Term 2": inactive_since_term1,
-        "Any Engagement": engagement_any,
-        "Ever Activated": ever_activated,
-    }, index=df.index)
-
+    flags = pd.DataFrame(
+        {
+            "Completed Milestones": milestone_any,
+            "Did Not Start": did_not_start,
+            "Active Last 6 Months": active_last_6m,
+            "Did Term 1, Not Active in Term 2": inactive_since_term1,
+            "Any Engagement": engagement_any,
+            "Ever Activated": ever_activated,
+        },
+        index=idx,
+    )
     return metrics, flags, six_month_cutoff
 
 
@@ -291,12 +276,11 @@ def render_drilldown_section(df_source: pd.DataFrame, entity_col: str, section_t
     selected_entity = st.selectbox(
         f"Search and select {section_title}",
         options=options,
-        index=0,
         key=f"drilldown_{entity_col}",
     )
 
     entity_df = df_source[make_safe_mask(df_source[entity_col], selected_entity)].copy()
-    entity_metrics, entity_flags, entity_cutoff = build_summary_metrics(entity_df)
+    entity_metrics, _, entity_cutoff = build_summary_metrics(entity_df)
 
     st.markdown(f"### {section_title}: {selected_entity}")
     m1, m2, m3, m4 = st.columns(4)
@@ -327,21 +311,15 @@ def render_drilldown_section(df_source: pd.DataFrame, entity_col: str, section_t
             missing = faculty_missing_mask(entity_df["Faculty Name"])
             faculty_df = pd.DataFrame({
                 "Faculty Assignment": ["Assigned", "Not Assigned"],
-                "Students": [int((~missing).sum()), int(missing.sum())]
+                "Students": [int((~missing).sum()), int(missing.sum())],
             })
-            faculty_df["Percentage"] = (faculty_df["Students"] / max(len(entity_df), 1) * 100).round(2)
             st.plotly_chart(plot_pie(faculty_df, "Faculty Assignment", "Students", "Faculty Assignment Split"), use_container_width=True)
-
     with lower_right:
         if "Last active date" in entity_df.columns:
-            timeline = (
-                entity_df.dropna(subset=["Last active date"])
-                .assign(Month=entity_df["Last active date"].dt.to_period("M").astype(str))
-                .groupby("Month")
-                .size()
-                .reset_index(name="Students")
-            )
-            if not timeline.empty:
+            active_source = entity_df.dropna(subset=["Last active date"]).copy()
+            if not active_source.empty:
+                active_source["Month"] = active_source["Last active date"].dt.to_period("M").astype(str)
+                timeline = active_source.groupby("Month").size().reset_index(name="Students")
                 fig = px.line(timeline, x="Month", y="Students", markers=True, title=f"Monthly Active Trend - {selected_entity}")
                 fig.update_layout(paper_bgcolor="white", plot_bgcolor="white", title_font_color="#123a73", height=430)
                 st.plotly_chart(fig, use_container_width=True)
@@ -352,9 +330,6 @@ def render_drilldown_section(df_source: pd.DataFrame, entity_col: str, section_t
         safe_dataframe(entity_df[snapshot_cols], height=360, max_rows=500)
 
 
-# -----------------------------
-# Header
-# -----------------------------
 st.markdown(
     """
     <div class='dashboard-banner'>
@@ -364,17 +339,18 @@ st.markdown(
     unsafe_allow_html=True,
 )
 
-st.sidebar.header("Filters")
-
-repo_data_path = "students.csv"
+st.sidebar.header("Data Source")
+uploaded_file = st.sidebar.file_uploader("Upload students CSV or Excel", type=["csv", "xlsx", "xls"])
 
 try:
-    raw_df = load_data(repo_data_path)
-    source_name = repo_data_path
+    raw_df, source_name = read_uploaded_or_local(uploaded_file)
 except Exception as exc:
-    st.error(f"Could not read `{repo_data_path}` from the repository: {exc}")
+    st.error(str(exc))
     st.stop()
 
+st.sidebar.success(f"Loaded: {source_name}")
+
+st.sidebar.header("Filters")
 df = clean_dataframe(raw_df)
 
 if "Email ID" in df.columns:
@@ -395,15 +371,9 @@ st.sidebar.caption(f"Source: {source_name}")
 
 metrics, flags, six_month_cutoff = build_summary_metrics(df)
 
-overview_tab, institutions_tab, engagement_tab, faculty_tab, grades_tab, drilldown_tab, data_tab = st.tabs([
-    "Overview",
-    "Institutions",
-    "Engagement",
-    "Faculty",
-    "Grades & Terms",
-    "Drilldown",
-    "Data Explorer",
-])
+overview_tab, institutions_tab, engagement_tab, faculty_tab, grades_tab, drilldown_tab, data_tab = st.tabs(
+    ["Overview", "Institutions", "Engagement", "Faculty", "Grades & Terms", "Drilldown", "Data Explorer"]
+)
 
 with overview_tab:
     c1, c2, c3, c4, c5 = st.columns(5)
@@ -418,26 +388,37 @@ with overview_tab:
     with c5:
         render_metric("Term 1 Done, Not Active in Term 2", f"{metrics['% Did Term 1 but Not Active in Term 2']:.2f}%")
 
-    st.caption(f"Activity window is fixed to the last 180 days from today. Cutoff date: {metrics['Activity Cutoff']}. Latest last-active date in filtered data: {metrics['Latest Last Active Date']}.")
+    st.caption(
+        f"Activity window is fixed to the last 180 days from today. Cutoff date: {metrics['Activity Cutoff']}. Latest last-active date in filtered data: {metrics['Latest Last Active Date']}."
+    )
 
     a1, a2 = st.columns(2)
     with a1:
-        summary_df = pd.DataFrame({
-            "Metric": ["Completed Milestones", "Didn’t Start", "Active in Last 6 Months", "Term 1 Done, Not Active in Term 2"],
-            "Percentage": [
-                metrics["% Completed Milestones"],
-                metrics["% Didn’t Start"],
-                metrics["% Active in Last 6 Months"],
-                metrics["% Did Term 1 but Not Active in Term 2"],
-            ]
-        })
+        summary_df = pd.DataFrame(
+            {
+                "Metric": [
+                    "Completed Milestones",
+                    "Didn’t Start",
+                    "Active in Last 6 Months",
+                    "Term 1 Done, Not Active in Term 2",
+                ],
+                "Percentage": [
+                    metrics["% Completed Milestones"],
+                    metrics["% Didn’t Start"],
+                    metrics["% Active in Last 6 Months"],
+                    metrics["% Did Term 1 but Not Active in Term 2"],
+                ],
+            }
+        )
         st.plotly_chart(plot_bar(summary_df, "Metric", "Percentage", "Core Overview Metrics"), use_container_width=True)
 
     with a2:
-        status_summary = pd.DataFrame({
-            "Activation State": ["Active in Last 6 Months", "Not Active in Last 6 Months"],
-            "Students": [int(flags["Active Last 6 Months"].sum()), int((~flags["Active Last 6 Months"]).sum())],
-        })
+        status_summary = pd.DataFrame(
+            {
+                "Activation State": ["Active in Last 6 Months", "Not Active in Last 6 Months"],
+                "Students": [int(flags["Active Last 6 Months"].sum()), int((~flags["Active Last 6 Months"]).sum())],
+            }
+        )
         st.plotly_chart(plot_pie(status_summary, "Activation State", "Students", "Activation Status Distribution"), use_container_width=True)
 
     st.subheader("Quick insights")
@@ -458,9 +439,9 @@ with overview_tab:
         if duplicate_emails is not None:
             render_metric("Duplicate Email IDs", f"{duplicate_emails:,}")
     with dq2:
-        render_metric("Ever Activated", f"{int(flags["Ever Activated"].sum()):,}")
+        render_metric("Ever Activated", f"{int(flags['Ever Activated'].sum()):,}")
     with dq3:
-        render_metric("Not Active in Last 6 Months", f"{int((~flags["Active Last 6 Months"]).sum()):,}")
+        render_metric("Not Active in Last 6 Months", f"{int((~flags['Active Last 6 Months']).sum()):,}")
 
 with institutions_tab:
     left, right = st.columns(2)
@@ -491,42 +472,42 @@ with engagement_tab:
     with e1:
         if "Activities completed" in df.columns:
             activity_series = df["Activities completed"].fillna(0)
-            bucket_df = pd.DataFrame({
-                "Bucket": ["No activity", "Low (1-10)", "Moderate (11-50)", "High (51+)"],
-                "Students": [
-                    int((activity_series == 0).sum()),
-                    int(activity_series.between(1, 10).sum()),
-                    int(activity_series.between(11, 50).sum()),
-                    int((activity_series > 50).sum()),
-                ]
-            })
+            bucket_df = pd.DataFrame(
+                {
+                    "Bucket": ["No activity", "Low (1-10)", "Moderate (11-50)", "High (51+)"],
+                    "Students": [
+                        int((activity_series == 0).sum()),
+                        int(activity_series.between(1, 10).sum()),
+                        int(activity_series.between(11, 50).sum()),
+                        int((activity_series > 50).sum()),
+                    ],
+                }
+            )
             bucket_df["Percentage"] = (bucket_df["Students"] / max(len(df), 1) * 100).round(2)
             st.plotly_chart(plot_bar(bucket_df, "Bucket", "Percentage", "Activity Intensity Split"), use_container_width=True)
 
     with e2:
         if "Last active date" in df.columns:
-            timeline = (
-                df.dropna(subset=["Last active date"])
-                .assign(Month=lambda x: x["Last active date"].dt.to_period("M").astype(str))
-                .groupby("Month")
-                .size()
-                .reset_index(name="Students")
-            )
-            if not timeline.empty:
+            active_source = df.dropna(subset=["Last active date"]).copy()
+            if not active_source.empty:
+                active_source["Month"] = active_source["Last active date"].dt.to_period("M").astype(str)
+                timeline = active_source.groupby("Month").size().reset_index(name="Students")
                 fig = px.line(timeline, x="Month", y="Students", markers=True, title="Students Active by Month")
                 fig.update_layout(paper_bgcolor="white", plot_bgcolor="white", title_font_color="#123a73", height=430)
                 st.plotly_chart(fig, use_container_width=True)
 
     st.subheader("Milestone progression by term")
-    term_milestone_cols = [c for c in df.columns if c.startswith("Term ") and c.endswith("Milestone Completed")]
+    term_milestone_cols = [c for c in df.columns if str(c).startswith("Term ") and str(c).endswith("Milestone Completed")]
     if term_milestone_cols:
-        milestone_pct_df = pd.DataFrame([
-            {
-                "Term Milestone": col.replace(" Milestone Completed", ""),
-                "Percentage": round((df[col].fillna(0) > 0).mean() * 100, 2)
-            }
-            for col in term_milestone_cols
-        ])
+        milestone_pct_df = pd.DataFrame(
+            [
+                {
+                    "Term Milestone": col.replace(" Milestone Completed", ""),
+                    "Percentage": round((df[col].fillna(0) > 0).mean() * 100, 2),
+                }
+                for col in term_milestone_cols
+            ]
+        )
         st.plotly_chart(plot_bar(milestone_pct_df, "Term Milestone", "Percentage", "Students Completing Each Term Milestone"), use_container_width=True)
         safe_dataframe(milestone_pct_df, height=300)
 
@@ -536,10 +517,7 @@ with faculty_tab:
         faculty_gap = (
             df.assign(FacultyMissing=faculty_missing_mask(df["Faculty Name"]))
             .groupby("College Name")
-            .agg(
-                Total_Students=("College Name", "size"),
-                Faculty_Not_Assigned=("FacultyMissing", "sum"),
-            )
+            .agg(Total_Students=("College Name", "size"), Faculty_Not_Assigned=("FacultyMissing", "sum"))
             .reset_index()
         )
         faculty_gap["Percentage"] = (faculty_gap["Faculty_Not_Assigned"] / faculty_gap["Total_Students"] * 100).round(2)
@@ -587,11 +565,7 @@ with grades_tab:
             )
             st.plotly_chart(fig, use_container_width=True)
 
-        safe_dataframe(
-            grade_heat.sort_values(["College Name", "Percentage"], ascending=[True, False]),
-            height=420,
-            max_rows=2000,
-        )
+        safe_dataframe(grade_heat.sort_values(["College Name", "Percentage"], ascending=[True, False]), height=420, max_rows=2000)
 
     st.subheader("Term-level comparison")
     if "Term" in df.columns:
@@ -616,11 +590,13 @@ with data_tab:
     safe_dataframe(df, height=420, max_rows=5000)
 
     st.markdown("### Column completeness")
-    completeness = pd.DataFrame({
-        "Column": df.columns,
-        "Non-null %": ((df.notna().sum() / max(len(df), 1)) * 100).round(2),
-        "Missing %": ((df.isna().sum() / max(len(df), 1)) * 100).round(2),
-    }).sort_values("Missing %", ascending=False)
+    completeness = pd.DataFrame(
+        {
+            "Column": df.columns,
+            "Non-null %": ((df.notna().sum() / max(len(df), 1)) * 100).round(2),
+            "Missing %": ((df.isna().sum() / max(len(df), 1)) * 100).round(2),
+        }
+    ).sort_values("Missing %", ascending=False)
     safe_dataframe(completeness, height=420)
 
 with st.expander("Metric definitions used in this dashboard"):
@@ -628,8 +604,9 @@ with st.expander("Metric definitions used in this dashboard"):
         """
         - **Completed milestones**: a student has a value greater than 0 in at least one `Term X Milestone Completed` column.
         - **Didn’t start**: no milestone, no activity, no task, and no activation date.
-        - **Active in last 6 months**: `Last active date` is within the last 180 days from today and the student has some activity, task, or milestone signal.
+        - **Active in last 6 months**: `Date of activation` exists and `Last active date` is within the last 180 days from today.
         - **Did semester/term 1 but not active in 2**: `Term 1 Milestone Completed > 0`, `Term 2 Milestone Completed = 0`, and the student is not active in the last 6 months.
         - **Faculty not assigned**: `Faculty Name` is blank or marked as `N/A`, `NA`, `Not Assigned`, or similar.
+        - **Status column**: ignored throughout the dashboard.
         """
     )
