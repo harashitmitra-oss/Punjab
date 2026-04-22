@@ -126,9 +126,6 @@ def parse_bytes_to_df(file_bytes: bytes, file_name: str) -> pd.DataFrame:
 
 
 @st.cache_data(show_spinner=False)
-import base64
-import requests
-
 def fetch_github_file(repo: str, branch: str, path: str, token: str):
     api_url = f"https://api.github.com/repos/{repo}/contents/{path}?ref={branch}"
 
