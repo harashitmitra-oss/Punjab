@@ -19,7 +19,7 @@ import streamlit as st
 # -----------------------------
 st.set_page_config(
     page_title="Punjab Startup Dashboard",
-    page_icon="",
+    page_icon="📊",
     layout="wide",
     initial_sidebar_state="expanded",
 )
@@ -222,7 +222,15 @@ def clean_text_value(series: pd.Series) -> pd.Series:
     return (
         series.astype("string")
         .str.strip()
-        .replace({"": pd.NA, "0": pd.NA, "0.0": pd.NA, "nan": pd.NA, "None": pd.NA, "NaN": pd.NA, "<NA>": pd.NA})
+        .replace({
+            "": pd.NA,
+            "0": pd.NA,
+            "0.0": pd.NA,
+            "nan": pd.NA,
+            "None": pd.NA,
+            "NaN": pd.NA,
+            "<NA>": pd.NA,
+        })
     )
 
 
@@ -276,12 +284,24 @@ def pct(part: float, whole: float) -> float:
 
 
 
-def percentage_table(series: pd.Series, label: str, top_n: Optional[int] = None) -> pd.DataFrame:
-    clean = clean_text_value(series).fillna("Unknown")
+def percentage_table(
+    series: pd.Series,
+    label: str,
+    top_n: Optional[int] = None,
+    ignore_zero_like: bool = True,
+) -> pd.DataFrame:
+    clean = clean_text_value(series)
+    if ignore_zero_like:
+        clean = clean.replace({"0": pd.NA, "0.0": pd.NA})
+    clean = clean.dropna()
+
+    if clean.empty:
+        return pd.DataFrame(columns=[label, "Students", "Percentage"])
+
     counts = clean.value_counts(dropna=False)
     if top_n is not None:
         counts = counts.head(top_n)
-    total = max(len(clean), 1)
+    total = max(int(counts.sum()), 1)
     out = counts.rename_axis(label).reset_index(name="Students")
     out["Percentage"] = (out["Students"] / total * 100).round(2)
     return out
@@ -364,19 +384,14 @@ def build_summary_metrics(df: pd.DataFrame):
     activation = df["Date of activation"] if "Date of activation" in df.columns else pd.Series(pd.NaT, index=idx)
     last_active = df["Last active date"] if "Last active date" in df.columns else pd.Series(pd.NaT, index=idx)
 
-    milestone_counts = pd.Series(0, index=idx, dtype="int64")
     milestone_any = pd.Series(False, index=idx)
     if term_cols:
-        milestone_frame = df[term_cols].apply(pd.to_numeric, errors="coerce").fillna(0)
-        milestone_any = milestone_frame.gt(0).any(axis=1)
-        milestone_counts = milestone_frame.gt(0).sum(axis=1).astype("int64")
+        milestone_any = df[term_cols].fillna(0).gt(0).any(axis=1)
 
     today = pd.Timestamp.today().normalize()
     six_month_cutoff = today - pd.Timedelta(days=180)
 
-    activity_any = activities.gt(0)
-    task_any = tasks.gt(0)
-    engagement_any = activity_any | task_any | milestone_any
+    engagement_any = (activities > 0) | (tasks > 0) | milestone_any
     ever_activated = activation.notna()
     active_last_6m = activation.notna() & last_active.notna() & (last_active >= six_month_cutoff)
     did_not_start = (~engagement_any) & activation.isna() & last_active.isna()
@@ -401,7 +416,7 @@ def build_summary_metrics(df: pd.DataFrame):
             "Did Term 1, Not Active in Term 2": inactive_since_term1,
             "Any Engagement": engagement_any,
             "Ever Activated": ever_activated,
-            "Milestones Completed Count": milestone_counts,
+            "Completed Milestones": milestone_any,
         },
         index=idx,
     )
@@ -686,7 +701,7 @@ with overview_tab:
         if duplicate_emails is not None:
             render_metric("Duplicate Email IDs", f"{duplicate_emails:,}")
     with dq2:
-        render_metric("Active Students", f"{int(flags['Active Students'].sum()):,}")
+        render_metric("Ever Activated", f"{int(flags['Ever Activated'].sum()):,}")
     with dq3:
         render_metric("Not Active in Last 6 Months", f"{int((~flags['Active Last 6 Months']).sum()):,}")
 
@@ -748,45 +763,66 @@ with engagement_tab:
                 st.plotly_chart(fig, use_container_width=True)
 
     st.subheader("Milestone progression by term")
-    term_milestone_cols = [c for c in df.columns if c.startswith("Term ") and c.endswith("Milestone Completed")]
-    if term_milestone_cols:
-        milestone_pct_df = pd.DataFrame(
-            [
-                {
-                    "Term Milestone": col.replace(" Milestone Completed", ""),
-                    "Percentage": round((pd.to_numeric(df[col], errors="coerce").fillna(0) > 0).mean() * 100, 2),
-                }
-                for col in term_milestone_cols
-            ]
-        )
-        st.plotly_chart(plot_bar(milestone_pct_df, "Term Milestone", "Percentage", "Students Completing Each Term Milestone"), use_container_width=True)
-        safe_dataframe(milestone_pct_df, height=300)
-
-        st.subheader("Milestones")
-        milestone_distribution = (
-            flags["Milestones Completed Count"]
-            .loc[flags["Milestones Completed Count"] > 0]
-            .value_counts()
-            .sort_index()
-            .rename_axis("Milestones Completed")
-            .reset_index(name="Students")
-        )
-        if not milestone_distribution.empty:
-            milestone_distribution["Milestones Completed"] = milestone_distribution["Milestones Completed"].astype(int).astype(str)
-            milestone_distribution["Percentage"] = (milestone_distribution["Students"] / max(len(df), 1) * 100).round(2)
-            m1, m2 = st.columns([1.2, 1])
-            with m1:
-                st.plotly_chart(
-                    plot_bar(
-                        milestone_distribution,
-                        "Milestones Completed",
-                        "Percentage",
-                        "Distribution of Students by Number of Milestones Completed",
-                    ),
-                    use_container_width=True,
+    raw_term_milestone_cols = [c for c in df.columns if c.startswith("Term ") and c.endswith("Milestone Completed")]
+    if raw_term_milestone_cols:
+        positive_term_milestone_cols = []
+        milestone_term_rows = []
+        for col in raw_term_milestone_cols:
+            numeric_col = pd.to_numeric(df[col], errors="coerce").fillna(0)
+            positive_count = int((numeric_col > 0).sum())
+            if positive_count > 0:
+                positive_term_milestone_cols.append(col)
+                milestone_term_rows.append(
+                    {
+                        "Term Milestone": col.replace(" Milestone Completed", ""),
+                        "Percentage": round((positive_count / max(len(df), 1)) * 100, 2),
+                    }
                 )
-            with m2:
-                safe_dataframe(milestone_distribution, height=300)
+
+        if positive_term_milestone_cols:
+            milestone_pct_df = pd.DataFrame(milestone_term_rows)
+            st.plotly_chart(plot_bar(milestone_pct_df, "Term Milestone", "Percentage", "Students Completing Each Term Milestone"), use_container_width=True)
+            safe_dataframe(milestone_pct_df, height=300)
+
+            st.subheader("Milestones")
+            milestone_count_series = (
+                df[positive_term_milestone_cols]
+                .apply(pd.to_numeric, errors="coerce")
+                .fillna(0)
+                .gt(0)
+                .sum(axis=1)
+            )
+            milestone_count_series = milestone_count_series[milestone_count_series > 0]
+
+            if not milestone_count_series.empty:
+                milestone_distribution = (
+                    milestone_count_series.value_counts()
+                    .sort_index()
+                    .rename_axis("Milestones Completed")
+                    .reset_index(name="Students")
+                )
+                milestone_distribution["Milestones Completed"] = milestone_distribution["Milestones Completed"].astype(int).astype(str)
+                milestone_distribution["Percentage"] = (
+                    milestone_distribution["Students"] / max(len(df), 1) * 100
+                ).round(2)
+
+                mcol1, mcol2 = st.columns([1.25, 1])
+                with mcol1:
+                    st.plotly_chart(
+                        plot_bar(
+                            milestone_distribution,
+                            "Milestones Completed",
+                            "Percentage",
+                            "Distribution of Students by Number of Milestones Completed",
+                        ),
+                        use_container_width=True,
+                    )
+                with mcol2:
+                    safe_dataframe(milestone_distribution, height=300)
+            else:
+                st.info("No students with milestone completion greater than 0 were found in the current filtered data.")
+        else:
+            st.info("No term milestone columns have values greater than 0 in the current filtered data.")
 
 with faculty_tab:
     st.subheader("Faculty assignment coverage")
@@ -846,12 +882,7 @@ with grades_tab:
 
     st.subheader("Term-level comparison")
     if "Term" in df.columns:
-        term_series = pd.to_numeric(df["Term"], errors="coerce")
-        valid_terms = term_series[term_series >= 1]
-        if not valid_terms.empty:
-            term_dist = percentage_table(valid_terms.astype("Int64").astype("string"), label="Term")
-        else:
-            term_dist = pd.DataFrame(columns=["Term", "Students", "Percentage"])
+        term_dist = percentage_table(df["Term"], label="Term", ignore_zero_like=True)
         g1, g2 = st.columns([1.1, 1])
         with g1:
             st.plotly_chart(plot_bar(term_dist, "Term", "Percentage", "Student Share by Term"), use_container_width=True)
@@ -894,9 +925,11 @@ with st.expander("Metric definitions used in this dashboard"):
     st.markdown(
         """
         - **Active Students**: a student has a value greater than 0 in at least one milestone, task, or activity field.
-        - **Didn’t start**: no task, activity, or milestone value above 0, with no activation date and no last active date. Zero values are treated like empty values.
+- **Completed milestones**: a student has a value greater than 0 in at least one `Term X Milestone Completed` column.
+        - **Didn’t start**: no activity above 0, no task above 0, no term milestone above 0, no activation date, and no last active date.
+- **Zero handling**: `0` and `0.0` are treated like empty values for percentage-style distributions such as term distribution.
         - **Active in last 6 months**: `Date of activation` is present and `Last active date` falls within the last 180 days from today.
-        - **Did semester/term 1 but not active in 2**: `Term 1 Milestone Completed > 0`, `Term 2 Milestone Completed <= 0`, and not active in the last 6 months.
+        - **Did semester/term 1 but not active in 2**: `Term 1 Milestone Completed > 0`, `Term 2 Milestone Completed = 0`, and not active in the last 6 months.
         - **Faculty not assigned**: `Faculty Name` is blank or marked as `N/A`, `NA`, or similar.
         - **GitHub persistence**: if configured in Streamlit secrets, the uploaded file can be saved to GitHub and used automatically on later app loads until another file is uploaded and saved.
         """
