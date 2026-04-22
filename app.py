@@ -19,7 +19,7 @@ import streamlit as st
 # -----------------------------
 st.set_page_config(
     page_title="Punjab Startup Dashboard",
-    page_icon="📊",
+    page_icon="",
     layout="wide",
     initial_sidebar_state="expanded",
 )
@@ -222,7 +222,7 @@ def clean_text_value(series: pd.Series) -> pd.Series:
     return (
         series.astype("string")
         .str.strip()
-        .replace({"": pd.NA, "nan": pd.NA, "None": pd.NA, "NaN": pd.NA, "<NA>": pd.NA})
+        .replace({"": pd.NA, "0": pd.NA, "0.0": pd.NA, "nan": pd.NA, "None": pd.NA, "NaN": pd.NA, "<NA>": pd.NA})
     )
 
 
@@ -364,14 +364,19 @@ def build_summary_metrics(df: pd.DataFrame):
     activation = df["Date of activation"] if "Date of activation" in df.columns else pd.Series(pd.NaT, index=idx)
     last_active = df["Last active date"] if "Last active date" in df.columns else pd.Series(pd.NaT, index=idx)
 
+    milestone_counts = pd.Series(0, index=idx, dtype="int64")
     milestone_any = pd.Series(False, index=idx)
     if term_cols:
-        milestone_any = df[term_cols].fillna(0).gt(0).any(axis=1)
+        milestone_frame = df[term_cols].apply(pd.to_numeric, errors="coerce").fillna(0)
+        milestone_any = milestone_frame.gt(0).any(axis=1)
+        milestone_counts = milestone_frame.gt(0).sum(axis=1).astype("int64")
 
     today = pd.Timestamp.today().normalize()
     six_month_cutoff = today - pd.Timedelta(days=180)
 
-    engagement_any = (activities > 0) | (tasks > 0) | milestone_any
+    activity_any = activities.gt(0)
+    task_any = tasks.gt(0)
+    engagement_any = activity_any | task_any | milestone_any
     ever_activated = activation.notna()
     active_last_6m = activation.notna() & last_active.notna() & (last_active >= six_month_cutoff)
     did_not_start = (~engagement_any) & activation.isna() & last_active.isna()
@@ -380,7 +385,7 @@ def build_summary_metrics(df: pd.DataFrame):
 
     metrics = {
         "Total Students": total,
-        "% Completed Milestones": round(pct(float(milestone_any.sum()), total), 2),
+        "% Active Students": round(pct(float(engagement_any.sum()), total), 2),
         "% Didn’t Start": round(pct(float(did_not_start.sum()), total), 2),
         "% Active in Last 6 Months": round(pct(float(active_last_6m.sum()), total), 2),
         "% Did Term 1 but Not Active in Term 2": round(pct(float(inactive_since_term1.sum()), total), 2),
@@ -390,12 +395,13 @@ def build_summary_metrics(df: pd.DataFrame):
 
     flags = pd.DataFrame(
         {
-            "Completed Milestones": milestone_any,
+            "Active Students": engagement_any,
             "Did Not Start": did_not_start,
             "Active Last 6 Months": active_last_6m,
             "Did Term 1, Not Active in Term 2": inactive_since_term1,
             "Any Engagement": engagement_any,
             "Ever Activated": ever_activated,
+            "Milestones Completed Count": milestone_counts,
         },
         index=idx,
     )
@@ -443,7 +449,7 @@ def render_drilldown_section(df_source: pd.DataFrame, entity_col: str, section_t
     with m1:
         render_metric("Students", f"{len(entity_df):,}")
     with m2:
-        render_metric("Completed Milestones", f"{entity_metrics['% Completed Milestones']:.2f}%")
+        render_metric("Active Students", f"{entity_metrics['% Active Students']:.2f}%")
     with m3:
         render_metric("Didn’t Start", f"{entity_metrics['% Didn’t Start']:.2f}%")
     with m4:
@@ -621,7 +627,7 @@ with overview_tab:
     with c1:
         render_metric("Total Students", f"{metrics['Total Students']:,}")
     with c2:
-        render_metric("Completed Milestones", f"{metrics['% Completed Milestones']:.2f}%")
+        render_metric("Active Students", f"{metrics['% Active Students']:.2f}%")
     with c3:
         render_metric("Didn’t Start", f"{metrics['% Didn’t Start']:.2f}%")
     with c4:
@@ -638,13 +644,13 @@ with overview_tab:
         summary_df = pd.DataFrame(
             {
                 "Metric": [
-                    "Completed Milestones",
+                    "Active Students",
                     "Didn’t Start",
                     "Active in Last 6 Months",
                     "Term 1 Done, Not Active in Term 2",
                 ],
                 "Percentage": [
-                    metrics["% Completed Milestones"],
+                    metrics["% Active Students"],
                     metrics["% Didn’t Start"],
                     metrics["% Active in Last 6 Months"],
                     metrics["% Did Term 1 but Not Active in Term 2"],
@@ -680,7 +686,7 @@ with overview_tab:
         if duplicate_emails is not None:
             render_metric("Duplicate Email IDs", f"{duplicate_emails:,}")
     with dq2:
-        render_metric("Ever Activated", f"{int(flags['Ever Activated'].sum()):,}")
+        render_metric("Active Students", f"{int(flags['Active Students'].sum()):,}")
     with dq3:
         render_metric("Not Active in Last 6 Months", f"{int((~flags['Active Last 6 Months']).sum()):,}")
 
@@ -756,6 +762,32 @@ with engagement_tab:
         st.plotly_chart(plot_bar(milestone_pct_df, "Term Milestone", "Percentage", "Students Completing Each Term Milestone"), use_container_width=True)
         safe_dataframe(milestone_pct_df, height=300)
 
+        st.subheader("Milestones")
+        milestone_distribution = (
+            flags["Milestones Completed Count"]
+            .loc[flags["Milestones Completed Count"] > 0]
+            .value_counts()
+            .sort_index()
+            .rename_axis("Milestones Completed")
+            .reset_index(name="Students")
+        )
+        if not milestone_distribution.empty:
+            milestone_distribution["Milestones Completed"] = milestone_distribution["Milestones Completed"].astype(int).astype(str)
+            milestone_distribution["Percentage"] = (milestone_distribution["Students"] / max(len(df), 1) * 100).round(2)
+            m1, m2 = st.columns([1.2, 1])
+            with m1:
+                st.plotly_chart(
+                    plot_bar(
+                        milestone_distribution,
+                        "Milestones Completed",
+                        "Percentage",
+                        "Distribution of Students by Number of Milestones Completed",
+                    ),
+                    use_container_width=True,
+                )
+            with m2:
+                safe_dataframe(milestone_distribution, height=300)
+
 with faculty_tab:
     st.subheader("Faculty assignment coverage")
     if "College Name" in df.columns and "Faculty Name" in df.columns:
@@ -814,7 +846,12 @@ with grades_tab:
 
     st.subheader("Term-level comparison")
     if "Term" in df.columns:
-        term_dist = percentage_table(df["Term"], label="Term")
+        term_series = pd.to_numeric(df["Term"], errors="coerce")
+        valid_terms = term_series[term_series >= 1]
+        if not valid_terms.empty:
+            term_dist = percentage_table(valid_terms.astype("Int64").astype("string"), label="Term")
+        else:
+            term_dist = pd.DataFrame(columns=["Term", "Students", "Percentage"])
         g1, g2 = st.columns([1.1, 1])
         with g1:
             st.plotly_chart(plot_bar(term_dist, "Term", "Percentage", "Student Share by Term"), use_container_width=True)
@@ -856,10 +893,10 @@ with data_tab:
 with st.expander("Metric definitions used in this dashboard"):
     st.markdown(
         """
-        - **Completed milestones**: a student has a value greater than 0 in at least one `Term X Milestone Completed` column.
-        - **Didn’t start**: `Activities completed = 0`, `Tasks completed = 0`, no term milestone completed, no activation date, and no last active date.
+        - **Active Students**: a student has a value greater than 0 in at least one milestone, task, or activity field.
+        - **Didn’t start**: no task, activity, or milestone value above 0, with no activation date and no last active date. Zero values are treated like empty values.
         - **Active in last 6 months**: `Date of activation` is present and `Last active date` falls within the last 180 days from today.
-        - **Did semester/term 1 but not active in 2**: `Term 1 Milestone Completed > 0`, `Term 2 Milestone Completed = 0`, and not active in the last 6 months.
+        - **Did semester/term 1 but not active in 2**: `Term 1 Milestone Completed > 0`, `Term 2 Milestone Completed <= 0`, and not active in the last 6 months.
         - **Faculty not assigned**: `Faculty Name` is blank or marked as `N/A`, `NA`, or similar.
         - **GitHub persistence**: if configured in Streamlit secrets, the uploaded file can be saved to GitHub and used automatically on later app loads until another file is uploaded and saved.
         """
