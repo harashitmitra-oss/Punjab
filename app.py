@@ -1,16 +1,22 @@
+from __future__ import annotations
 
 import base64
+import hashlib
 import io
 import json
-from typing import Optional, Tuple
+from pathlib import Path
+from typing import Optional
 
 import numpy as np
 import pandas as pd
 import plotly.express as px
+import plotly.graph_objects as go
 import requests
 import streamlit as st
 
-
+# -----------------------------
+# Page config and styling
+# -----------------------------
 st.set_page_config(
     page_title="Punjab Startup Dashboard",
     page_icon="📊",
@@ -24,17 +30,12 @@ CUSTOM_CSS = """
     --blue-900: #103a71;
     --blue-800: #1d4f91;
     --blue-700: #316fc2;
-    --blue-100: #eff6ff;
-    --blue-050: #f8fbff;
-    --white: #ffffff;
-    --slate: #5b677a;
-    --border: #e6eef9;
 }
 .main {
     background: linear-gradient(180deg, #fbfdff 0%, #f2f7ff 100%);
 }
 .block-container {
-    padding-top: 1.15rem;
+    padding-top: 1.2rem;
     padding-bottom: 2rem;
 }
 h1, h2, h3 {
@@ -42,7 +43,7 @@ h1, h2, h3 {
 }
 .dashboard-banner {
     background: linear-gradient(90deg, var(--blue-900), var(--blue-700));
-    padding: 1.1rem 1.3rem;
+    padding: 1.15rem 1.35rem;
     border-radius: 18px;
     color: white;
     margin-bottom: 1rem;
@@ -50,720 +51,794 @@ h1, h2, h3 {
 }
 .metric-card {
     background: white;
-    border: 1px solid var(--border);
+    border: 1px solid #e7eefb;
     padding: 1rem;
     border-radius: 18px;
     box-shadow: 0 8px 24px rgba(31,77,143,0.08);
     height: 100%;
 }
-.metric-label {
-    color: var(--slate);
-    font-size: 0.92rem;
-    margin-bottom: 0.25rem;
-}
-.metric-value {
-    color: var(--blue-900);
-    font-size: 1.8rem;
-    font-weight: 700;
-    line-height: 1.1;
-}
-.metric-sub {
-    color: var(--slate);
-    font-size: 0.85rem;
-    margin-top: 0.35rem;
-}
 .small-note {
-    color: var(--slate);
-    font-size: 0.9rem;
+    color: #5b677a;
+    font-size: 0.92rem;
 }
 [data-testid="stSidebar"] {
-    background: linear-gradient(180deg, #f6faff 0%, #edf5ff 100%);
-    border-right: 1px solid var(--border);
+    background: linear-gradient(180deg, #f4f8ff 0%, #eaf2ff 100%);
+}
+.stTabs [data-baseweb="tab-list"] {
+    gap: 0.4rem;
+}
+.stTabs [data-baseweb="tab"] {
+    background: #eef5ff;
+    border-radius: 10px;
+    padding: 0.5rem 0.9rem;
+}
+.stTabs [aria-selected="true"] {
+    background: #dbeafe !important;
+    color: #123a73 !important;
 }
 </style>
 """
 st.markdown(CUSTOM_CSS, unsafe_allow_html=True)
 
-TITLE = "Punjab Startup Dashboard"
 
-DATE_COLUMNS = [
-    "Date of sign up start",
-    "Student Created At",
-    "Date of activation",
-    "Last active date",
+# -----------------------------
+# Utility helpers
+# -----------------------------
+def get_secret(name: str, default: str = "") -> str:
+    try:
+        value = st.secrets.get(name, default)
+        return str(value) if value is not None else default
+    except Exception:
+        return default
+
+
+GITHUB_TOKEN = get_secret("GITHUB_TOKEN")
+GITHUB_REPO = get_secret("GITHUB_REPO")  # owner/repo
+GITHUB_BRANCH = get_secret("GITHUB_BRANCH", "main")
+GITHUB_DATA_PATH = get_secret("GITHUB_DATA_PATH", "data/students.csv")
+
+
+def github_configured() -> bool:
+    return bool(GITHUB_TOKEN and GITHUB_REPO and GITHUB_BRANCH and GITHUB_DATA_PATH)
+
+
+LOCAL_CANDIDATES = [
+    Path("students.csv"),
+    Path("data/students.csv"),
+    Path("students.xlsx"),
+    Path("data/students.xlsx"),
 ]
 
-TEXT_COLUMNS = [
-    "Name",
-    "Email ID",
-    "College Name",
-    "University Name",
-    "Faculty Name",
-    "Track Name",
-    "Business Name",
-    "Business Category",
-    "Term 1 Final Grade",
-]
 
-NUMERIC_COLUMNS = [
-    "No of track tried",
-    "Term",
-    "Activities completed",
-    "Tasks completed",
-    "Points",
-    "Badges",
-    "Revenue",
-    "No of sales",
-    "No of offerings",
-    "Final Activity Score",
-    "Final Point Score",
-    "Final Revenue Score",
-    "Term 1 Final Score",
-]
-
-MILESTONE_COLUMNS = [f"Term {i} Milestone Completed" for i in range(1, 11)]
-
-DISPLAY_COLUMNS = [
-    "Name",
-    "Email ID",
-    "College Name",
-    "University Name",
-    "Faculty Name",
-    "Track Name",
-    "Term",
-    "Date of activation",
-    "Last active date",
-    "Activities completed",
-    "Tasks completed",
-] + MILESTONE_COLUMNS[:4] + ["Term 1 Final Grade"]
+def file_digest(data: bytes) -> str:
+    return hashlib.sha256(data).hexdigest()[:12]
 
 
-def safe_text(value) -> str:
-    if pd.isna(value):
+@st.cache_data(show_spinner=False)
+def parse_bytes_to_df(file_bytes: bytes, file_name: str) -> pd.DataFrame:
+    lower = file_name.lower()
+    bio = io.BytesIO(file_bytes)
+    if lower.endswith(".csv"):
+        return pd.read_csv(bio, low_memory=False)
+    if lower.endswith((".xlsx", ".xls")):
+        return pd.read_excel(bio)
+    raise ValueError("Please upload a CSV or Excel file.")
+
+
+@st.cache_data(show_spinner=False)
+def fetch_github_file(repo: str, branch: str, path: str, token: str) -> tuple[bytes, str]:
+    api_url = f"https://api.github.com/repos/{repo}/contents/{path}?ref={branch}"
+    headers = {
+        "Accept": "application/vnd.github+json",
+        "Authorization": f"Bearer {token}",
+        "X-GitHub-Api-Version": "2022-11-28",
+    }
+    response = requests.get(api_url, headers=headers, timeout=30)
+    if response.status_code != 200:
+        raise RuntimeError(f"GitHub load failed: {response.status_code} {response.text[:200]}")
+    payload = response.json()
+    content = payload.get("content", "")
+    encoding = payload.get("encoding", "")
+    if encoding != "base64" or not content:
+        raise RuntimeError("GitHub file content was not returned as base64.")
+    return base64.b64decode(content), payload.get("sha", "")
+
+
+@st.cache_data(show_spinner=False)
+def load_local_file(path_str: str) -> tuple[pd.DataFrame, str]:
+    path = Path(path_str)
+    if path.suffix.lower() == ".csv":
+        return pd.read_csv(path, low_memory=False), path.as_posix()
+    return pd.read_excel(path), path.as_posix()
+
+
+@st.cache_data(show_spinner=False)
+def get_github_sha(repo: str, branch: str, path: str, token: str) -> str:
+    api_url = f"https://api.github.com/repos/{repo}/contents/{path}?ref={branch}"
+    headers = {
+        "Accept": "application/vnd.github+json",
+        "Authorization": f"Bearer {token}",
+        "X-GitHub-Api-Version": "2022-11-28",
+    }
+    response = requests.get(api_url, headers=headers, timeout=30)
+    if response.status_code == 200:
+        return response.json().get("sha", "")
+    if response.status_code == 404:
         return ""
-    return str(value).strip()
+    raise RuntimeError(f"GitHub SHA lookup failed: {response.status_code} {response.text[:200]}")
 
 
-def normalize_blank_series(series: pd.Series) -> pd.Series:
-    return series.astype("string").str.strip().replace(
-        {"": pd.NA, "nan": pd.NA, "None": pd.NA, "NAN": pd.NA}
+def upload_file_to_github(file_bytes: bytes, destination_path: str, commit_message: str) -> str:
+    if not github_configured():
+        raise RuntimeError("GitHub persistence is not configured in Streamlit secrets.")
+
+    existing_sha = get_github_sha(GITHUB_REPO, GITHUB_BRANCH, destination_path, GITHUB_TOKEN)
+    api_url = f"https://api.github.com/repos/{GITHUB_REPO}/contents/{destination_path}"
+    headers = {
+        "Accept": "application/vnd.github+json",
+        "Authorization": f"Bearer {GITHUB_TOKEN}",
+        "X-GitHub-Api-Version": "2022-11-28",
+    }
+    payload = {
+        "message": commit_message,
+        "content": base64.b64encode(file_bytes).decode("utf-8"),
+        "branch": GITHUB_BRANCH,
+    }
+    if existing_sha:
+        payload["sha"] = existing_sha
+
+    response = requests.put(api_url, headers=headers, data=json.dumps(payload), timeout=60)
+    if response.status_code not in (200, 201):
+        raise RuntimeError(f"GitHub upload failed: {response.status_code} {response.text[:300]}")
+    fetch_github_file.clear()
+    get_github_sha.clear()
+    return destination_path
+
+
+
+def clean_text_value(series: pd.Series) -> pd.Series:
+    return (
+        series.astype("string")
+        .str.strip()
+        .replace({"": pd.NA, "nan": pd.NA, "None": pd.NA, "NaN": pd.NA, "<NA>": pd.NA})
     )
 
 
-def parse_dates(series: pd.Series) -> pd.Series:
-    """Robust date parsing across pandas versions and mixed values."""
-    s = series.copy()
-    s = s.replace({0: np.nan, "0": np.nan, "0.0": np.nan, "": np.nan})
-    parsed = pd.to_datetime(s, errors="coerce")
 
-    remaining = parsed.isna()
-    if remaining.any():
-        numeric = pd.to_numeric(s.where(remaining), errors="coerce")
-        numeric_mask = numeric.notna()
-        if numeric_mask.any():
-            excel_dates = pd.to_datetime("1899-12-30") + pd.to_timedelta(
-                numeric[numeric_mask], unit="D"
-            )
-            parsed.loc[numeric_mask.index[numeric_mask]] = excel_dates.values
-    return parsed
+def clean_dataframe(df: pd.DataFrame) -> pd.DataFrame:
+    out = df.copy()
+    out.columns = [str(c).strip() for c in out.columns]
+
+    for col in out.columns:
+        if pd.api.types.is_object_dtype(out[col]) or pd.api.types.is_string_dtype(out[col]):
+            out[col] = out[col].replace({np.inf: np.nan, -np.inf: np.nan})
+
+    likely_date_cols = [
+        "Date of sign up start",
+        "Student Created At",
+        "Date of activation",
+        "Last active date",
+    ]
+    for col in likely_date_cols:
+        if col in out.columns:
+            out[col] = pd.to_datetime(out[col], errors="coerce")
+
+    numeric_hints = [
+        "Activities completed",
+        "Tasks completed",
+        "Points",
+        "Badges",
+        "Revenue",
+        "No of sales",
+        "No of offerings",
+        "Final Activity Score",
+        "Final Point Score",
+        "Final Revenue Score",
+        "Term 1 Final Score",
+        "No of track tried",
+    ]
+    numeric_cols = [
+        c
+        for c in out.columns
+        if c in numeric_hints or (str(c).startswith("Term ") and "Milestone Completed" in str(c))
+    ]
+    for col in numeric_cols:
+        out[col] = pd.to_numeric(out[col], errors="coerce")
+
+    return out
 
 
-def positive_mask(series: pd.Series) -> pd.Series:
-    numeric = pd.to_numeric(series, errors="coerce")
-    return numeric.fillna(0).gt(0)
+
+def pct(part: float, whole: float) -> float:
+    return 0.0 if whole == 0 else (part / whole) * 100.0
 
 
-def non_empty_non_zero_mask(series: pd.Series) -> pd.Series:
-    numeric = pd.to_numeric(series, errors="coerce")
-    is_non_zero_numeric = numeric.notna() & numeric.ne(0)
-    text = normalize_blank_series(series)
-    has_text = text.notna() & ~text.isin(["0", "0.0"])
-    return is_non_zero_numeric | has_text
+
+def percentage_table(series: pd.Series, label: str, top_n: Optional[int] = None) -> pd.DataFrame:
+    clean = clean_text_value(series).fillna("Unknown")
+    counts = clean.value_counts(dropna=False)
+    if top_n is not None:
+        counts = counts.head(top_n)
+    total = max(len(clean), 1)
+    out = counts.rename_axis(label).reset_index(name="Students")
+    out["Percentage"] = (out["Students"] / total * 100).round(2)
+    return out
 
 
-def format_pct(numerator: int, denominator: int) -> str:
-    if denominator == 0:
-        return "0.0%"
-    return f"{(numerator / denominator) * 100:.1f}%"
 
+def sanitize_for_display(df: pd.DataFrame, max_rows: Optional[int] = None) -> pd.DataFrame:
+    out = df.copy()
+    if max_rows is not None:
+        out = out.head(max_rows).copy()
 
-def make_display_safe(df: pd.DataFrame) -> pd.DataFrame:
-    safe_df = df.copy()
-    for col in safe_df.columns:
-        if pd.api.types.is_datetime64_any_dtype(safe_df[col]):
-            safe_df[col] = safe_df[col].dt.strftime("%Y-%m-%d")
-        elif pd.api.types.is_timedelta64_dtype(safe_df[col]):
-            safe_df[col] = safe_df[col].astype(str)
+    for col in out.columns:
+        if pd.api.types.is_datetime64_any_dtype(out[col]):
+            out[col] = out[col].dt.strftime("%Y-%m-%d")
+        elif pd.api.types.is_float_dtype(out[col]):
+            out[col] = out[col].replace([np.inf, -np.inf], np.nan)
         else:
-            safe_df[col] = safe_df[col].map(lambda x: None if pd.isna(x) else str(x))
-    return safe_df
+            out[col] = out[col].astype("string")
+    return out
 
 
-def styled_metric(label: str, value: str, sub: str = ""):
+
+def safe_dataframe(df: pd.DataFrame, height: int = 420, max_rows: Optional[int] = None, hide_index: bool = True):
+    st.dataframe(
+        sanitize_for_display(df, max_rows=max_rows),
+        use_container_width=True,
+        height=height,
+        hide_index=hide_index,
+    )
+
+
+
+def plot_bar(df_plot: pd.DataFrame, x: str, y: str, title: str, height: int = 430):
+    fig = px.bar(df_plot, x=x, y=y, text=y, title=title)
+    fig.update_layout(
+        paper_bgcolor="white",
+        plot_bgcolor="white",
+        title_font_color="#123a73",
+        xaxis_title=None,
+        yaxis_title=None,
+        margin=dict(l=10, r=10, t=50, b=10),
+        height=height,
+    )
+    if y.lower().startswith("percent"):
+        fig.update_traces(texttemplate="%{text:.2f}%", textposition="outside")
+    else:
+        fig.update_traces(textposition="outside")
+    return fig
+
+
+
+def plot_pie(df_plot: pd.DataFrame, names: str, values: str, title: str):
+    fig = px.pie(df_plot, names=names, values=values, hole=0.45, title=title)
+    fig.update_layout(
+        paper_bgcolor="white",
+        title_font_color="#123a73",
+        margin=dict(l=10, r=10, t=50, b=10),
+        height=430,
+    )
+    fig.update_traces(textposition="inside", textinfo="percent+label")
+    return fig
+
+
+
+def faculty_missing_mask(series: pd.Series) -> pd.Series:
+    cleaned = clean_text_value(series)
+    return cleaned.isna() | cleaned.str.lower().isin(["n/a", "na", "not assigned", "none"])
+
+
+
+def build_summary_metrics(df: pd.DataFrame):
+    total = len(df)
+    idx = df.index
+
+    term_cols = [c for c in df.columns if str(c).startswith("Term ") and str(c).endswith("Milestone Completed")]
+    activities = df["Activities completed"].fillna(0) if "Activities completed" in df.columns else pd.Series(0, index=idx)
+    tasks = df["Tasks completed"].fillna(0) if "Tasks completed" in df.columns else pd.Series(0, index=idx)
+    term1 = df["Term 1 Milestone Completed"].fillna(0) if "Term 1 Milestone Completed" in df.columns else pd.Series(0, index=idx)
+    term2 = df["Term 2 Milestone Completed"].fillna(0) if "Term 2 Milestone Completed" in df.columns else pd.Series(0, index=idx)
+    activation = df["Date of activation"] if "Date of activation" in df.columns else pd.Series(pd.NaT, index=idx)
+    last_active = df["Last active date"] if "Last active date" in df.columns else pd.Series(pd.NaT, index=idx)
+
+    milestone_any = pd.Series(False, index=idx)
+    if term_cols:
+        milestone_any = df[term_cols].fillna(0).gt(0).any(axis=1)
+
+    today = pd.Timestamp.today().normalize()
+    six_month_cutoff = today - pd.Timedelta(days=180)
+
+    engagement_any = (activities > 0) | (tasks > 0) | milestone_any
+    ever_activated = activation.notna()
+    active_last_6m = activation.notna() & last_active.notna() & (last_active >= six_month_cutoff)
+    did_not_start = (~engagement_any) & activation.isna() & last_active.isna()
+    term1_done_not_term2 = (term1 > 0) & (term2 <= 0)
+    inactive_since_term1 = term1_done_not_term2 & (~active_last_6m)
+
+    metrics = {
+        "Total Students": total,
+        "% Completed Milestones": round(pct(float(milestone_any.sum()), total), 2),
+        "% Didn’t Start": round(pct(float(did_not_start.sum()), total), 2),
+        "% Active in Last 6 Months": round(pct(float(active_last_6m.sum()), total), 2),
+        "% Did Term 1 but Not Active in Term 2": round(pct(float(inactive_since_term1.sum()), total), 2),
+        "Activity Cutoff": six_month_cutoff.strftime("%d %b %Y"),
+        "Latest Last Active Date": last_active.max().strftime("%d %b %Y") if last_active.notna().any() else "N/A",
+    }
+
+    flags = pd.DataFrame(
+        {
+            "Completed Milestones": milestone_any,
+            "Did Not Start": did_not_start,
+            "Active Last 6 Months": active_last_6m,
+            "Did Term 1, Not Active in Term 2": inactive_since_term1,
+            "Any Engagement": engagement_any,
+            "Ever Activated": ever_activated,
+        },
+        index=idx,
+    )
+    return metrics, flags, six_month_cutoff
+
+
+
+def render_metric(label: str, value: str):
     st.markdown(
         f"""
         <div class='metric-card'>
-            <div class='metric-label'>{label}</div>
-            <div class='metric-value'>{value}</div>
-            <div class='metric-sub'>{sub}</div>
+            <div style='font-size:0.95rem;color:#5b677a;'>{label}</div>
+            <div style='font-size:1.8rem;font-weight:700;color:#123a73;margin-top:0.25rem;'>{value}</div>
         </div>
         """,
         unsafe_allow_html=True,
     )
 
 
-def render_bar(df: pd.DataFrame, x: str, y: str, title: str, color: Optional[str] = None):
-    if df.empty:
-        st.info("No data available for this view.")
+
+def make_safe_mask(series: pd.Series, value: str) -> pd.Series:
+    normalized = clean_text_value(series).fillna("Unknown")
+    return normalized == value
+
+
+
+def render_drilldown_section(df_source: pd.DataFrame, entity_col: str, section_title: str):
+    if entity_col not in df_source.columns:
+        st.info(f"{entity_col} column not found.")
         return
-    fig = px.bar(df, x=x, y=y, title=title, color=color, text=y)
-    fig.update_traces(texttemplate="%{text:.1f}" if pd.api.types.is_numeric_dtype(df[y]) else "%{text}", textposition="outside")
-    fig.update_layout(
-        height=430,
-        xaxis_title=None,
-        yaxis_title=None,
-        margin=dict(l=10, r=10, t=50, b=10),
-    )
-    st.plotly_chart(fig, use_container_width=True)
 
-
-def render_pie(df: pd.DataFrame, names: str, values: str, title: str):
-    if df.empty:
-        st.info("No data available for this view.")
-        return
-    fig = px.pie(df, names=names, values=values, title=title, hole=0.55)
-    fig.update_layout(height=420, margin=dict(l=10, r=10, t=50, b=10))
-    st.plotly_chart(fig, use_container_width=True)
-
-
-def top_share_table(df: pd.DataFrame, column: str, top_n: int = 15) -> pd.DataFrame:
-    if column not in df.columns:
-        return pd.DataFrame(columns=[column, "Students", "% of valid rows"])
-    values = normalize_blank_series(df[column])
-    counts = values.dropna().value_counts().head(top_n)
-    total = counts.sum()
-    if total == 0:
-        return pd.DataFrame(columns=[column, "Students", "% of valid rows"])
-    out = counts.rename_axis(column).reset_index(name="Students")
-    out["% of valid rows"] = out["Students"] / total * 100
-    return out
-
-
-def get_github_settings() -> Optional[dict]:
-    try:
-        token = st.secrets.get("GITHUB_TOKEN")
-        repo = st.secrets.get("GITHUB_REPO")
-        if not token or not repo:
-            return None
-        return {
-            "token": token,
-            "repo": repo,
-            "branch": st.secrets.get("GITHUB_BRANCH", "main"),
-            "path": st.secrets.get("GITHUB_DATA_PATH", "data/students.csv"),
-        }
-    except Exception:
-        return None
-
-
-def fetch_github_file(repo: str, branch: str, path: str, token: str) -> Tuple[bytes, str]:
-    api_url = f"https://api.github.com/repos/{repo}/contents/{path}?ref={branch}"
-    headers = {
-        "Authorization": f"Bearer {token}",
-        "Accept": "application/vnd.github.object+json",
-        "X-GitHub-Api-Version": "2022-11-28",
-    }
-    resp = requests.get(api_url, headers=headers, timeout=30)
-    resp.raise_for_status()
-    payload = resp.json()
-    sha = payload.get("sha", "")
-
-    if payload.get("encoding") == "base64" and payload.get("content"):
-        return base64.b64decode(payload["content"]), sha
-
-    download_url = payload.get("download_url")
-    if download_url:
-        raw_resp = requests.get(download_url, timeout=60)
-        raw_resp.raise_for_status()
-        return raw_resp.content, sha
-
-    raw_headers = {
-        "Authorization": f"Bearer {token}",
-        "Accept": "application/vnd.github.raw+json",
-        "X-GitHub-Api-Version": "2022-11-28",
-    }
-    raw_resp = requests.get(api_url, headers=raw_headers, timeout=60)
-    raw_resp.raise_for_status()
-    if raw_resp.content:
-        return raw_resp.content, sha
-
-    raise RuntimeError("Could not retrieve GitHub file content.")
-
-
-def save_github_file(repo: str, branch: str, path: str, token: str, content: bytes, commit_message: str):
-    url = f"https://api.github.com/repos/{repo}/contents/{path}"
-    headers = {
-        "Authorization": f"Bearer {token}",
-        "Accept": "application/vnd.github+json",
-        "X-GitHub-Api-Version": "2022-11-28",
-    }
-    sha = None
-    get_resp = requests.get(f"{url}?ref={branch}", headers=headers, timeout=30)
-    if get_resp.status_code == 200:
-        sha = get_resp.json().get("sha")
-    elif get_resp.status_code not in (404,):
-        get_resp.raise_for_status()
-
-    payload = {
-        "message": commit_message,
-        "content": base64.b64encode(content).decode("utf-8"),
-        "branch": branch,
-    }
-    if sha:
-        payload["sha"] = sha
-
-    put_resp = requests.put(url, headers=headers, data=json.dumps(payload), timeout=60)
-    put_resp.raise_for_status()
-    return put_resp.json()
-
-
-def read_uploaded_or_bytes(file_bytes: bytes, filename: str) -> pd.DataFrame:
-    lower = filename.lower()
-    bio = io.BytesIO(file_bytes)
-    if lower.endswith(".csv"):
-        return pd.read_csv(bio, low_memory=False)
-    if lower.endswith(".xlsx") or lower.endswith(".xls"):
-        return pd.read_excel(bio)
-    raise ValueError("Only CSV and Excel files are supported.")
-
-
-def load_data_from_path(path: str) -> pd.DataFrame:
-    lower = path.lower()
-    if lower.endswith(".csv"):
-        return pd.read_csv(path, low_memory=False)
-    if lower.endswith(".xlsx") or lower.endswith(".xls"):
-        return pd.read_excel(path)
-    raise ValueError(f"Unsupported file type for {path}")
-
-
-@st.cache_data(show_spinner=False)
-def preprocess_data(raw_df: pd.DataFrame) -> pd.DataFrame:
-    df = raw_df.copy()
-    df.columns = [safe_text(c) for c in df.columns]
-
-    for col in TEXT_COLUMNS:
-        if col in df.columns:
-            df[col] = normalize_blank_series(df[col])
-
-    for col in DATE_COLUMNS:
-        if col in df.columns:
-            df[col] = parse_dates(df[col])
-
-    for col in NUMERIC_COLUMNS + [c for c in MILESTONE_COLUMNS if c in df.columns]:
-        if col in df.columns:
-            df[col] = pd.to_numeric(df[col], errors="coerce")
-
-    available_milestones = [c for c in MILESTONE_COLUMNS if c in df.columns]
-
-    if available_milestones:
-        milestone_positive = pd.concat([positive_mask(df[c]) for c in available_milestones], axis=1)
-        df["Milestones Completed Count"] = milestone_positive.sum(axis=1)
-    else:
-        df["Milestones Completed Count"] = 0
-
-    df["Activities Positive"] = positive_mask(df["Activities completed"]) if "Activities completed" in df.columns else False
-    df["Tasks Positive"] = positive_mask(df["Tasks completed"]) if "Tasks completed" in df.columns else False
-
-    df["Active Student"] = (
-        df["Milestones Completed Count"].gt(0)
-        | df["Activities Positive"]
-        | df["Tasks Positive"]
+    options = sorted(clean_text_value(df_source[entity_col]).fillna("Unknown").unique().tolist())
+    selected_entity = st.selectbox(
+        f"Search and select {section_title}",
+        options=options,
+        index=0,
+        key=f"drilldown_{entity_col}",
     )
 
-    df["Ever Activated"] = df["Date of activation"].notna() if "Date of activation" in df.columns else False
+    entity_df = df_source[make_safe_mask(df_source[entity_col], selected_entity)].copy()
+    entity_metrics, _, entity_cutoff = build_summary_metrics(entity_df)
 
-    if "Last active date" in df.columns:
-        cutoff = pd.Timestamp.today().normalize() - pd.Timedelta(days=180)
-        df["Active in Last 6 Months"] = df["Last active date"].notna() & df["Last active date"].ge(cutoff)
-    else:
-        df["Active in Last 6 Months"] = False
+    st.markdown(f"### {section_title}: {selected_entity}")
+    m1, m2, m3, m4 = st.columns(4)
+    with m1:
+        render_metric("Students", f"{len(entity_df):,}")
+    with m2:
+        render_metric("Completed Milestones", f"{entity_metrics['% Completed Milestones']:.2f}%")
+    with m3:
+        render_metric("Didn’t Start", f"{entity_metrics['% Didn’t Start']:.2f}%")
+    with m4:
+        render_metric("Active in Last 6 Months", f"{entity_metrics['% Active in Last 6 Months']:.2f}%")
 
-    df["Did Not Start"] = ~(
-        df["Active Student"]
-        | df["Ever Activated"]
-        | df["Active in Last 6 Months"]
-    )
+    st.caption(f"Fixed 6-month activity cutoff used here: {entity_cutoff.strftime('%d %b %Y')}")
 
-    term1_positive = positive_mask(df["Term 1 Milestone Completed"]) if "Term 1 Milestone Completed" in df.columns else pd.Series(False, index=df.index)
-    term2_positive = positive_mask(df["Term 2 Milestone Completed"]) if "Term 2 Milestone Completed" in df.columns else pd.Series(False, index=df.index)
-    df["Did Term 1 but not active in 2"] = term1_positive & ~term2_positive
+    left, right = st.columns(2)
+    with left:
+        if "Track Name" in entity_df.columns:
+            track_tbl = percentage_table(entity_df["Track Name"], label="Track Name")
+            st.plotly_chart(plot_bar(track_tbl.head(15), "Track Name", "Percentage", f"Track Mix in {selected_entity}"), use_container_width=True)
+    with right:
+        if "Term 1 Final Grade" in entity_df.columns:
+            grade_tbl = percentage_table(entity_df["Term 1 Final Grade"], label="Term 1 Final Grade")
+            st.plotly_chart(plot_bar(grade_tbl, "Term 1 Final Grade", "Percentage", f"Term 1 Grade Mix in {selected_entity}"), use_container_width=True)
 
-    if "Faculty Name" in df.columns:
-        faculty_norm = normalize_blank_series(df["Faculty Name"])
-        df["Faculty Unassigned"] = faculty_norm.isna() | faculty_norm.str.upper().eq("N/A")
-    else:
-        df["Faculty Unassigned"] = False
+    lower_left, lower_right = st.columns(2)
+    with lower_left:
+        if "Faculty Name" in entity_df.columns:
+            missing = faculty_missing_mask(entity_df["Faculty Name"])
+            faculty_df = pd.DataFrame(
+                {
+                    "Faculty Assignment": ["Assigned", "Not Assigned"],
+                    "Students": [int((~missing).sum()), int(missing.sum())],
+                }
+            )
+            st.plotly_chart(plot_pie(faculty_df, "Faculty Assignment", "Students", "Faculty Assignment Split"), use_container_width=True)
 
-    return df
+    with lower_right:
+        if "Last active date" in entity_df.columns:
+            timeline = (
+                entity_df.dropna(subset=["Last active date"])
+                .assign(Month=lambda x: x["Last active date"].dt.to_period("M").astype(str))
+                .groupby("Month")
+                .size()
+                .reset_index(name="Students")
+            )
+            if not timeline.empty:
+                fig = px.line(timeline, x="Month", y="Students", markers=True, title=f"Monthly Active Trend - {selected_entity}")
+                fig.update_layout(paper_bgcolor="white", plot_bgcolor="white", title_font_color="#123a73", height=430)
+                st.plotly_chart(fig, use_container_width=True)
+
+    snapshot_cols = [
+        c for c in ["Name", "Email ID", "Track Name", "Term", "Activities completed", "Tasks completed", "Date of activation", "Last active date"]
+        if c in entity_df.columns
+    ]
+    if snapshot_cols:
+        st.markdown("#### Student snapshot")
+        safe_dataframe(entity_df[snapshot_cols], height=360, max_rows=500)
 
 
-def choose_data_source() -> Tuple[pd.DataFrame, str, Optional[bytes], Optional[str]]:
-    uploaded_file = st.sidebar.file_uploader(
-        "Upload CSV or Excel",
-        type=["csv", "xlsx", "xls"],
-        help="Upload a fresh file anytime. You can also save the uploaded file to GitHub for future loads.",
-    )
-
-    github_cfg = get_github_settings()
-
+# -----------------------------
+# Data source resolution
+# -----------------------------
+def resolve_data_source(uploaded_file) -> tuple[pd.DataFrame, str, str]:
     if uploaded_file is not None:
         file_bytes = uploaded_file.getvalue()
-        df = read_uploaded_or_bytes(file_bytes, uploaded_file.name)
-        st.session_state["uploaded_file_bytes"] = file_bytes
-        st.session_state["uploaded_file_name"] = uploaded_file.name
-        return df, f"Uploaded file: {uploaded_file.name}", file_bytes, uploaded_file.name
+        df = parse_bytes_to_df(file_bytes, uploaded_file.name)
+        origin = f"Uploaded: {uploaded_file.name}"
+        file_id = file_digest(file_bytes)
+        st.session_state["active_file_bytes"] = file_bytes
+        st.session_state["active_file_name"] = uploaded_file.name
+        st.session_state["active_file_origin"] = origin
+        st.session_state["active_file_id"] = file_id
+        return df, origin, file_id
 
-    if "uploaded_file_bytes" in st.session_state and "uploaded_file_name" in st.session_state:
-        file_bytes = st.session_state["uploaded_file_bytes"]
-        file_name = st.session_state["uploaded_file_name"]
-        df = read_uploaded_or_bytes(file_bytes, file_name)
-        return df, f"Current session file: {file_name}", file_bytes, file_name
+    if "active_file_bytes" in st.session_state and "active_file_name" in st.session_state:
+        df = parse_bytes_to_df(st.session_state["active_file_bytes"], st.session_state["active_file_name"])
+        return df, st.session_state.get("active_file_origin", "Uploaded in this session"), st.session_state.get("active_file_id", "session")
 
-    if github_cfg:
-        try:
-            raw_bytes, _ = fetch_github_file(
-                repo=github_cfg["repo"],
-                branch=github_cfg["branch"],
-                path=github_cfg["path"],
-                token=github_cfg["token"],
-            )
-            filename = github_cfg["path"].split("/")[-1]
-            df = read_uploaded_or_bytes(raw_bytes, filename)
-            return df, f"GitHub saved file: {github_cfg['path']}", None, None
-        except Exception as exc:
-            st.sidebar.warning(f"GitHub load skipped: {exc}")
+    if github_configured():
+        file_bytes, _sha = fetch_github_file(GITHUB_REPO, GITHUB_BRANCH, GITHUB_DATA_PATH, GITHUB_TOKEN)
+        file_name = Path(GITHUB_DATA_PATH).name
+        df = parse_bytes_to_df(file_bytes, file_name)
+        origin = f"GitHub: {GITHUB_REPO}/{GITHUB_DATA_PATH}@{GITHUB_BRANCH}"
+        return df, origin, file_digest(file_bytes)
 
-    local_candidates = [
-        "data/students.csv",
-        "students.csv",
-        "data/students.xlsx",
-        "students.xlsx",
-    ]
-    for candidate in local_candidates:
-        try:
-            df = load_data_from_path(candidate)
-            return df, f"Repository file: {candidate}", None, None
-        except Exception:
-            continue
+    for candidate in LOCAL_CANDIDATES:
+        if candidate.exists():
+            df, source = load_local_file(candidate.as_posix())
+            return df, f"Local file: {source}", candidate.as_posix()
 
-    st.error("No data source found. Upload a CSV/Excel file, or keep the saved file in `data/students.csv`.")
-    st.stop()
+    raise FileNotFoundError(
+        "No data source found. Upload a CSV/Excel file from the sidebar, or configure GitHub persistence in Streamlit secrets."
+    )
 
 
-raw_df, source_label, uploaded_bytes, uploaded_name = choose_data_source()
-df = preprocess_data(raw_df)
-github_cfg = get_github_settings()
-
+# -----------------------------
+# Header
+# -----------------------------
 st.markdown(
-    f"""
+    """
     <div class='dashboard-banner'>
-        <h1 style='margin:0; color:white;'>{TITLE}</h1>
-        <div style='opacity:0.95; margin-top:0.35rem;'>Source: {source_label}</div>
+        <div style='font-size:2rem;font-weight:800;'>Punjab Startup Dashboard</div>
     </div>
     """,
     unsafe_allow_html=True,
 )
 
-with st.sidebar:
-    st.subheader("Controls")
+# Sidebar controls
+st.sidebar.header("Data")
+uploaded_file = st.sidebar.file_uploader("Upload CSV or Excel", type=["csv", "xlsx", "xls"])
 
-    if uploaded_bytes is not None and uploaded_name is not None:
-        if github_cfg:
-            if st.button("Save uploaded file for future app loads", use_container_width=True):
-                save_name = uploaded_name.split("/")[-1]
-                path = github_cfg["path"]
-                if "." in path and path.split(".")[-1].lower() != save_name.split(".")[-1].lower():
-                    path = "/".join(path.split("/")[:-1] + [save_name]) if "/" in path else save_name
-                try:
-                    save_github_file(
-                        repo=github_cfg["repo"],
-                        branch=github_cfg["branch"],
-                        path=path,
-                        token=github_cfg["token"],
-                        content=uploaded_bytes,
-                        commit_message=f"Update dashboard data: {save_name}",
-                    )
-                    st.success(f"Saved to GitHub at `{path}`")
-                except Exception as exc:
-                    st.error(f"GitHub save failed: {exc}")
+if uploaded_file is not None and uploaded_file.name:
+    if st.sidebar.button("Save uploaded file for future app loads", use_container_width=True):
+        if github_configured():
+            try:
+                target_path = GITHUB_DATA_PATH
+                msg = f"Update dashboard data: {uploaded_file.name}"
+                upload_file_to_github(uploaded_file.getvalue(), target_path, msg)
+                st.sidebar.success(f"Saved to GitHub at `{target_path}`. Future loads will use this file until you upload and save another one.")
+            except Exception as exc:
+                st.sidebar.error(str(exc))
         else:
-            st.info("Add GitHub secrets to enable saving uploaded files for future app loads.")
+            st.sidebar.warning(
+                "GitHub persistence is not set up yet. Add `GITHUB_TOKEN`, `GITHUB_REPO`, `GITHUB_BRANCH`, and `GITHUB_DATA_PATH` in Streamlit secrets to enable this."
+            )
 
-    college_options = sorted(df["College Name"].dropna().unique().tolist()) if "College Name" in df.columns else []
-    university_options = sorted(df["University Name"].dropna().unique().tolist()) if "University Name" in df.columns else []
-    track_options = sorted(df["Track Name"].dropna().unique().tolist()) if "Track Name" in df.columns else []
-    grade_options = sorted(df["Term 1 Final Grade"].dropna().unique().tolist()) if "Term 1 Final Grade" in df.columns else []
+try:
+    raw_df, source_name, source_id = resolve_data_source(uploaded_file)
+except Exception as exc:
+    st.error(f"Could not load data: {exc}")
+    st.stop()
 
-    selected_colleges = st.multiselect("College Name", college_options)
-    selected_universities = st.multiselect("University Name", university_options)
-    selected_tracks = st.multiselect("Track Name", track_options)
-    selected_grades = st.multiselect("Term 1 Final Grade", grade_options)
-    only_active_students = st.checkbox("Only active students", value=False)
+# Clean and analyze
+df = clean_dataframe(raw_df)
 
-filtered_df = df.copy()
-if selected_colleges and "College Name" in filtered_df.columns:
-    filtered_df = filtered_df[filtered_df["College Name"].isin(selected_colleges)]
-if selected_universities and "University Name" in filtered_df.columns:
-    filtered_df = filtered_df[filtered_df["University Name"].isin(selected_universities)]
-if selected_tracks and "Track Name" in filtered_df.columns:
-    filtered_df = filtered_df[filtered_df["Track Name"].isin(selected_tracks)]
-if selected_grades and "Term 1 Final Grade" in filtered_df.columns:
-    filtered_df = filtered_df[filtered_df["Term 1 Final Grade"].isin(selected_grades)]
-if only_active_students:
-    filtered_df = filtered_df[filtered_df["Active Student"]]
+# Sidebar info
+st.sidebar.markdown("---")
+st.sidebar.caption(f"Current source: {source_name}")
+st.sidebar.caption(f"Rows loaded: {len(df):,}")
+if github_configured():
+    st.sidebar.caption("Persistence: GitHub enabled")
+else:
+    st.sidebar.caption("Persistence: session/local only")
 
-n = len(filtered_df)
-active_count = int(filtered_df["Active Student"].sum()) if "Active Student" in filtered_df.columns else 0
-not_started_count = int(filtered_df["Did Not Start"].sum()) if "Did Not Start" in filtered_df.columns else 0
-ever_activated_count = int(filtered_df["Ever Activated"].sum()) if "Ever Activated" in filtered_df.columns else 0
-active_6m_count = int(filtered_df["Active in Last 6 Months"].sum()) if "Active in Last 6 Months" in filtered_df.columns else 0
-term1_not2_count = int(filtered_df["Did Term 1 but not active in 2"].sum()) if "Did Term 1 but not active in 2" in filtered_df.columns else 0
+# Filters
+st.sidebar.header("Filters")
+if "Status" in df.columns:
+    # Ignored by request.
+    pass
 
-c1, c2, c3, c4, c5 = st.columns(5)
-with c1:
-    styled_metric("Total Students", f"{n:,}", "Rows in current filtered view")
-with c2:
-    styled_metric("Active Students", format_pct(active_count, n), f"{active_count:,} students")
-with c3:
-    styled_metric("Didn't Start", format_pct(not_started_count, n), f"{not_started_count:,} students")
-with c4:
-    styled_metric("Ever Activated", format_pct(ever_activated_count, n), f"{ever_activated_count:,} students")
-with c5:
-    styled_metric("Active in Last 6 Months", format_pct(active_6m_count, n), f"{active_6m_count:,} students")
+for col in ["University Name", "College Name", "Track Name", "Term"]:
+    if col in df.columns:
+        options = sorted(clean_text_value(df[col]).dropna().unique().tolist())
+        selected = st.sidebar.multiselect(col, options)
+        if selected:
+            df = df[clean_text_value(df[col]).isin(selected)]
 
-st.markdown(
-    "<div class='small-note'>`Status` is ignored. Participation metrics treat 0 values the same as blank values and only count values above 0.</div>",
-    unsafe_allow_html=True,
-)
+st.sidebar.markdown("---")
+st.sidebar.caption(f"Rows after filters: {len(df):,}")
 
-overview_tab, milestones_tab, drilldown_tab, explorer_tab = st.tabs(
-    ["Overview", "Milestones", "Drilldown", "Data Explorer"]
+metrics, flags, six_month_cutoff = build_summary_metrics(df)
+
+if "Email ID" in df.columns:
+    duplicate_emails = int(df["Email ID"].dropna().duplicated().sum())
+else:
+    duplicate_emails = None
+
+overview_tab, institutions_tab, engagement_tab, faculty_tab, grades_tab, drilldown_tab, data_tab = st.tabs(
+    [
+        "Overview",
+        "Institutions",
+        "Engagement",
+        "Faculty",
+        "Grades & Terms",
+        "Drilldown",
+        "Data Explorer",
+    ]
 )
 
 with overview_tab:
-    left, right = st.columns([1.15, 0.85])
-    with left:
-        st.markdown("### Overview")
+    c1, c2, c3, c4, c5 = st.columns(5)
+    with c1:
+        render_metric("Total Students", f"{metrics['Total Students']:,}")
+    with c2:
+        render_metric("Completed Milestones", f"{metrics['% Completed Milestones']:.2f}%")
+    with c3:
+        render_metric("Didn’t Start", f"{metrics['% Didn’t Start']:.2f}%")
+    with c4:
+        render_metric("Active in Last 6 Months", f"{metrics['% Active in Last 6 Months']:.2f}%")
+    with c5:
+        render_metric("Term 1 Done, Not Active in Term 2", f"{metrics['% Did Term 1 but Not Active in Term 2']:.2f}%")
+
+    st.caption(
+        f"Activity uses only `Date of activation` and `Last active date`. Fixed 180-day cutoff from today: {metrics['Activity Cutoff']}. Latest last-active date in filtered data: {metrics['Latest Last Active Date']}."
+    )
+
+    a1, a2 = st.columns(2)
+    with a1:
         summary_df = pd.DataFrame(
             {
                 "Metric": [
-                    "Active Students",
-                    "Didn't Start",
-                    "Ever Activated",
+                    "Completed Milestones",
+                    "Didn’t Start",
                     "Active in Last 6 Months",
-                    "Did Term 1 but not active in 2",
+                    "Term 1 Done, Not Active in Term 2",
                 ],
                 "Percentage": [
-                    active_count / n * 100 if n else 0,
-                    not_started_count / n * 100 if n else 0,
-                    ever_activated_count / n * 100 if n else 0,
-                    active_6m_count / n * 100 if n else 0,
-                    term1_not2_count / n * 100 if n else 0,
+                    metrics["% Completed Milestones"],
+                    metrics["% Didn’t Start"],
+                    metrics["% Active in Last 6 Months"],
+                    metrics["% Did Term 1 but Not Active in Term 2"],
                 ],
             }
         )
-        render_bar(summary_df, "Metric", "Percentage", "Core student percentages")
-    with right:
-        st.markdown("### Term Distribution")
-        if "Term" in filtered_df.columns:
-            term_numeric = pd.to_numeric(filtered_df["Term"], errors="coerce")
-            term_df = filtered_df[term_numeric.fillna(0).gt(0)].copy()
-            if not term_df.empty:
-                term_df["Term Clean"] = pd.to_numeric(term_df["Term"], errors="coerce").astype("Int64").astype(str)
-                term_counts = term_df["Term Clean"].value_counts().sort_index().rename_axis("Term").reset_index(name="Students")
-                render_pie(term_counts, "Term", "Students", "Students by Term (0 ignored)")
-            else:
-                st.info("No term values above 0.")
-        else:
-            st.info("Term column not available.")
+        st.plotly_chart(plot_bar(summary_df, "Metric", "Percentage", "Core Overview Metrics"), use_container_width=True)
 
-    col1, col2 = st.columns(2)
-    with col1:
-        st.markdown("### College Name distribution")
-        college_share = top_share_table(filtered_df, "College Name", top_n=20)
-        render_bar(college_share, "College Name", "% of valid rows", "Top colleges by student share")
-    with col2:
-        st.markdown("### University Name distribution")
-        uni_share = top_share_table(filtered_df, "University Name", top_n=20)
-        render_bar(uni_share, "University Name", "% of valid rows", "Top universities by student share")
-
-    col3, col4 = st.columns(2)
-    with col3:
-        st.markdown("### Track Name distribution")
-        track_share = top_share_table(filtered_df, "Track Name", top_n=20)
-        render_bar(track_share, "Track Name", "% of valid rows", "Top tracks by student share")
-    with col4:
-        st.markdown("### Faculty not assigned by college")
-        if {"College Name", "Faculty Unassigned"}.issubset(filtered_df.columns):
-            valid = filtered_df[filtered_df["College Name"].notna()].copy()
-            faculty_df = (
-                valid.groupby("College Name", dropna=False)["Faculty Unassigned"]
-                .mean()
-                .mul(100)
-                .sort_values(ascending=False)
-                .head(20)
-                .rename("% Faculty N/A")
-                .reset_index()
-            )
-            render_bar(faculty_df, "College Name", "% Faculty N/A", "Colleges with highest unassigned faculty share")
-        else:
-            st.info("Faculty or college columns not available.")
-
-    st.markdown("### College-wise Term 1 Final Grade")
-    if {"College Name", "Term 1 Final Grade"}.issubset(filtered_df.columns):
-        grade_df = filtered_df[["College Name", "Term 1 Final Grade"]].dropna().copy()
-        if not grade_df.empty:
-            top_colleges = grade_df["College Name"].value_counts().head(12).index
-            grade_df = grade_df[grade_df["College Name"].isin(top_colleges)]
-            grade_grouped = grade_df.groupby(["College Name", "Term 1 Final Grade"]).size().reset_index(name="Students")
-            fig = px.bar(
-                grade_grouped,
-                x="College Name",
-                y="Students",
-                color="Term 1 Final Grade",
-                barmode="stack",
-                title="Top colleges by Term 1 Final Grade mix",
-            )
-            fig.update_layout(height=460, xaxis_title=None, yaxis_title=None, margin=dict(l=10, r=10, t=50, b=10))
-            st.plotly_chart(fig, use_container_width=True)
-        else:
-            st.info("No valid grade rows available.")
-
-with milestones_tab:
-    st.markdown("### Milestones")
-    total_students = len(filtered_df)
-    available_milestones = [c for c in MILESTONE_COLUMNS if c in filtered_df.columns]
-
-    if available_milestones:
-        cards1 = st.columns(min(5, len(available_milestones)))
-        for idx, col in enumerate(available_milestones[:5]):
-            count = int(positive_mask(filtered_df[col]).sum())
-            with cards1[idx]:
-                styled_metric(col.replace(" Completed", ""), format_pct(count, total_students), f"{count:,} students")
-
-        if len(available_milestones) > 5:
-            cards2 = st.columns(len(available_milestones[5:10]))
-            for idx, col in enumerate(available_milestones[5:10]):
-                count = int(positive_mask(filtered_df[col]).sum())
-                with cards2[idx]:
-                    styled_metric(col.replace(" Completed", ""), format_pct(count, total_students), f"{count:,} students")
-
-        milestone_dist = (
-            filtered_df["Milestones Completed Count"]
-            .value_counts()
-            .sort_index()
-            .rename_axis("Milestones Completed")
-            .reset_index(name="Students")
+    with a2:
+        state_df = pd.DataFrame(
+            {
+                "Activation State": ["Active in Last 6 Months", "Not Active in Last 6 Months"],
+                "Students": [int(flags["Active Last 6 Months"].sum()), int((~flags["Active Last 6 Months"]).sum())],
+            }
         )
-        milestone_dist = milestone_dist[milestone_dist["Milestones Completed"] > 0].copy()
-        if not milestone_dist.empty:
-            milestone_dist["Percentage"] = milestone_dist["Students"] / total_students * 100
-            render_bar(milestone_dist, "Milestones Completed", "Percentage", "Students by number of milestones completed")
-            st.dataframe(make_display_safe(milestone_dist), use_container_width=True, height=260)
-        else:
-            st.info("No milestone completions above 0 found in the current filtered view.")
-    else:
-        st.info("No milestone columns found in the data.")
+        st.plotly_chart(plot_pie(state_df, "Activation State", "Students", "Activation Status Distribution"), use_container_width=True)
 
-with drilldown_tab:
-    st.markdown("### Drilldown")
-    mode = st.radio("Choose drilldown type", ["College Name", "University Name"], horizontal=True)
-    if mode in filtered_df.columns:
-        options = sorted(filtered_df[mode].dropna().unique().tolist())
-    else:
-        options = []
+    st.subheader("Quick insights")
+    q1, q2, q3 = st.columns(3)
+    with q1:
+        if "College Name" in df.columns:
+            safe_dataframe(percentage_table(df["College Name"], label="College Name", top_n=10), height=320)
+    with q2:
+        if "University Name" in df.columns:
+            safe_dataframe(percentage_table(df["University Name"], label="University Name", top_n=10), height=320)
+    with q3:
+        if "Track Name" in df.columns:
+            safe_dataframe(percentage_table(df["Track Name"], label="Track Name"), height=320)
 
-    selected = st.selectbox(f"Select {mode}", options) if options else None
-    if selected:
-        subset = filtered_df[filtered_df[mode] == selected].copy()
-        s_n = len(subset)
+    st.subheader("Data quality checks")
+    dq1, dq2, dq3 = st.columns(3)
+    with dq1:
+        if duplicate_emails is not None:
+            render_metric("Duplicate Email IDs", f"{duplicate_emails:,}")
+    with dq2:
+        render_metric("Ever Activated", f"{int(flags['Ever Activated'].sum()):,}")
+    with dq3:
+        render_metric("Not Active in Last 6 Months", f"{int((~flags['Active Last 6 Months']).sum()):,}")
 
-        d1, d2, d3, d4 = st.columns(4)
-        with d1:
-            styled_metric("Students", f"{s_n:,}")
-        with d2:
-            styled_metric("Active Students", format_pct(int(subset["Active Student"].sum()), s_n))
-        with d3:
-            styled_metric("Didn't Start", format_pct(int(subset["Did Not Start"].sum()), s_n))
-        with d4:
-            styled_metric("Active in Last 6 Months", format_pct(int(subset["Active in Last 6 Months"].sum()), s_n))
+with institutions_tab:
+    left, right = st.columns(2)
+    if "College Name" in df.columns:
+        college_tbl = percentage_table(df["College Name"], label="College Name", top_n=20)
+        with left:
+            st.plotly_chart(plot_bar(college_tbl, "College Name", "Percentage", "% of Students in Each College Name", height=500), use_container_width=True)
+            safe_dataframe(college_tbl, height=360)
+    if "University Name" in df.columns:
+        uni_tbl = percentage_table(df["University Name"], label="University Name", top_n=20)
+        with right:
+            st.plotly_chart(plot_bar(uni_tbl, "University Name", "Percentage", "% of Students in Each University Name", height=500), use_container_width=True)
+            safe_dataframe(uni_tbl, height=360)
 
-        a, b = st.columns(2)
-        with a:
-            track_df = top_share_table(subset, "Track Name", top_n=12)
-            render_bar(track_df, "Track Name", "% of valid rows", f"Track mix in {selected}")
-        with b:
-            grade_small = top_share_table(subset, "Term 1 Final Grade", top_n=12)
-            render_bar(grade_small, "Term 1 Final Grade", "% of valid rows", f"Term 1 Final Grade mix in {selected}")
+    st.subheader("Track distribution")
+    if "Track Name" in df.columns:
+        track_tbl = percentage_table(df["Track Name"], label="Track Name")
+        t1, t2 = st.columns([1.2, 1])
+        with t1:
+            st.plotly_chart(plot_bar(track_tbl, "Track Name", "Percentage", "% of Students in Each Track Name"), use_container_width=True)
+        with t2:
+            safe_dataframe(track_tbl, height=360)
 
-        if "Last active date" in subset.columns:
-            monthly = subset.dropna(subset=["Last active date"]).copy()
-            if not monthly.empty:
-                monthly["Activity Month"] = monthly["Last active date"].dt.to_period("M").astype(str)
-                monthly_df = monthly.groupby("Activity Month").size().reset_index(name="Students")
-                render_bar(monthly_df, "Activity Month", "Students", f"Recent activity trend in {selected}")
+with engagement_tab:
+    st.subheader("Activity and milestone analysis")
+    e1, e2 = st.columns(2)
 
-        st.markdown("### Student snapshot")
-        available_display_cols = [c for c in DISPLAY_COLUMNS if c in subset.columns]
-        st.dataframe(make_display_safe(subset[available_display_cols].head(1000)), use_container_width=True, height=420)
-
-with explorer_tab:
-    st.markdown("### Data Explorer")
-    q = st.text_input("Search by name or email")
-    explorer_df = filtered_df.copy()
-
-    if q:
-        pattern = q.strip().lower()
-        name_match = explorer_df["Name"].fillna("").str.lower().str.contains(pattern, regex=False) if "Name" in explorer_df.columns else False
-        email_match = explorer_df["Email ID"].fillna("").str.lower().str.contains(pattern, regex=False) if "Email ID" in explorer_df.columns else False
-        explorer_df = explorer_df[name_match | email_match]
-
-    qc1, qc2, qc3 = st.columns(3)
-    with qc1:
-        duplicate_emails = explorer_df["Email ID"].dropna().duplicated().sum() if "Email ID" in explorer_df.columns else 0
-        styled_metric("Duplicate email rows", f"{int(duplicate_emails):,}")
-    with qc2:
-        styled_metric("Rows shown", f"{len(explorer_df):,}")
-    with qc3:
-        positive_term_rows = int(pd.to_numeric(explorer_df.get("Term", pd.Series(dtype=float)), errors="coerce").fillna(0).gt(0).sum()) if "Term" in explorer_df.columns else 0
-        styled_metric("Rows with term > 0", f"{positive_term_rows:,}")
-
-    completeness_rows = []
-    for col in [
-        "Email ID",
-        "College Name",
-        "University Name",
-        "Faculty Name",
-        "Track Name",
-        "Date of activation",
-        "Last active date",
-        "Term 1 Final Grade",
-    ]:
-        if col in explorer_df.columns:
-            if pd.api.types.is_datetime64_any_dtype(explorer_df[col]):
-                present = int(explorer_df[col].notna().sum())
-            else:
-                present = int(non_empty_non_zero_mask(explorer_df[col]).sum())
-            completeness_rows.append(
+    with e1:
+        if "Activities completed" in df.columns:
+            activity_series = pd.to_numeric(df["Activities completed"], errors="coerce").fillna(0)
+            bucket_df = pd.DataFrame(
                 {
-                    "Column": col,
-                    "Present rows": present,
-                    "Completeness %": (present / len(explorer_df) * 100) if len(explorer_df) else 0,
+                    "Bucket": ["No activity", "Low (1-10)", "Moderate (11-50)", "High (51+)"],
+                    "Students": [
+                        int((activity_series == 0).sum()),
+                        int(activity_series.between(1, 10).sum()),
+                        int(activity_series.between(11, 50).sum()),
+                        int((activity_series > 50).sum()),
+                    ],
                 }
             )
+            bucket_df["Percentage"] = (bucket_df["Students"] / max(len(df), 1) * 100).round(2)
+            st.plotly_chart(plot_bar(bucket_df, "Bucket", "Percentage", "Activity Intensity Split"), use_container_width=True)
 
-    if completeness_rows:
-        completeness_df = pd.DataFrame(completeness_rows).sort_values("Completeness %", ascending=False)
-        render_bar(completeness_df, "Column", "Completeness %", "Column completeness (0 treated as empty where relevant)")
+    with e2:
+        if "Last active date" in df.columns:
+            timeline = (
+                df.dropna(subset=["Last active date"])
+                .assign(Month=lambda x: x["Last active date"].dt.to_period("M").astype(str))
+                .groupby("Month")
+                .size()
+                .reset_index(name="Students")
+            )
+            if not timeline.empty:
+                fig = px.line(timeline, x="Month", y="Students", markers=True, title="Students Active by Month")
+                fig.update_layout(paper_bgcolor="white", plot_bgcolor="white", title_font_color="#123a73", height=430)
+                st.plotly_chart(fig, use_container_width=True)
 
-    available_display_cols = [c for c in DISPLAY_COLUMNS if c in explorer_df.columns]
-    st.dataframe(make_display_safe(explorer_df[available_display_cols].head(5000)), use_container_width=True, height=460)
+    st.subheader("Milestone progression by term")
+    term_milestone_cols = [c for c in df.columns if c.startswith("Term ") and c.endswith("Milestone Completed")]
+    if term_milestone_cols:
+        milestone_pct_df = pd.DataFrame(
+            [
+                {
+                    "Term Milestone": col.replace(" Milestone Completed", ""),
+                    "Percentage": round((pd.to_numeric(df[col], errors="coerce").fillna(0) > 0).mean() * 100, 2),
+                }
+                for col in term_milestone_cols
+            ]
+        )
+        st.plotly_chart(plot_bar(milestone_pct_df, "Term Milestone", "Percentage", "Students Completing Each Term Milestone"), use_container_width=True)
+        safe_dataframe(milestone_pct_df, height=300)
+
+with faculty_tab:
+    st.subheader("Faculty assignment coverage")
+    if "College Name" in df.columns and "Faculty Name" in df.columns:
+        faculty_gap = (
+            df.assign(FacultyMissing=faculty_missing_mask(df["Faculty Name"]))
+            .groupby("College Name")
+            .agg(Total_Students=("College Name", "size"), Faculty_Not_Assigned=("FacultyMissing", "sum"))
+            .reset_index()
+        )
+        faculty_gap["Percentage"] = (faculty_gap["Faculty_Not_Assigned"] / faculty_gap["Total_Students"] * 100).round(2)
+        faculty_gap = faculty_gap.sort_values(["Percentage", "Faculty_Not_Assigned"], ascending=[False, False])
+
+        f1, f2 = st.columns([1.35, 1])
+        with f1:
+            st.plotly_chart(plot_bar(faculty_gap.head(20), "College Name", "Percentage", "% of Students in Each College Where Faculty is N/A", height=520), use_container_width=True)
+        with f2:
+            safe_dataframe(faculty_gap, height=520)
+
+with grades_tab:
+    st.subheader("Term 1 final grade by college")
+    if "College Name" in df.columns and "Term 1 Final Grade" in df.columns:
+        grade_heat = (
+            df.assign(**{"Term 1 Final Grade": clean_text_value(df["Term 1 Final Grade"]).fillna("Unknown")})
+            .groupby(["College Name", "Term 1 Final Grade"])
+            .size()
+            .reset_index(name="Students")
+        )
+        totals = grade_heat.groupby("College Name")["Students"].transform("sum")
+        grade_heat["Percentage"] = (grade_heat["Students"] / totals * 100).round(2)
+
+        top_colleges = clean_text_value(df["College Name"]).fillna("Unknown").value_counts().head(20).index.tolist()
+        heat_top = grade_heat[grade_heat["College Name"].isin(top_colleges)]
+        pivot = heat_top.pivot(index="College Name", columns="Term 1 Final Grade", values="Percentage").fillna(0)
+
+        if not pivot.empty:
+            fig = go.Figure(
+                data=go.Heatmap(
+                    z=pivot.values,
+                    x=pivot.columns.tolist(),
+                    y=pivot.index.tolist(),
+                    text=np.round(pivot.values, 1),
+                    texttemplate="%{text}%",
+                    colorscale="Blues",
+                )
+            )
+            fig.update_layout(
+                title="% of Students in Each College by Term 1 Final Grade (Top 20 Colleges)",
+                paper_bgcolor="white",
+                plot_bgcolor="white",
+                title_font_color="#123a73",
+                height=650,
+            )
+            st.plotly_chart(fig, use_container_width=True)
+
+        safe_dataframe(grade_heat.sort_values(["College Name", "Percentage"], ascending=[True, False]), height=420, max_rows=2000)
+
+    st.subheader("Term-level comparison")
+    if "Term" in df.columns:
+        term_dist = percentage_table(df["Term"], label="Term")
+        g1, g2 = st.columns([1.1, 1])
+        with g1:
+            st.plotly_chart(plot_bar(term_dist, "Term", "Percentage", "Student Share by Term"), use_container_width=True)
+        with g2:
+            safe_dataframe(term_dist, height=260)
+
+with drilldown_tab:
+    st.subheader("Searchable college and university drilldown")
+    st.caption("Pick one college or one university to see a focused breakdown.")
+    drill_mode = st.radio("Drill down by", ["College Name", "University Name"], horizontal=True)
+    if drill_mode == "College Name":
+        render_drilldown_section(df, "College Name", "College")
+    else:
+        render_drilldown_section(df, "University Name", "University")
+
+with data_tab:
+    st.subheader("Data explorer")
+    safe_dataframe(df, height=420, max_rows=5000)
+
+    csv_buffer = io.StringIO()
+    sanitize_for_display(df).to_csv(csv_buffer, index=False)
+    st.download_button(
+        "Download filtered data as CSV",
+        data=csv_buffer.getvalue(),
+        file_name="filtered_students_data.csv",
+        mime="text/csv",
+    )
+
+    st.markdown("### Column completeness")
+    completeness = pd.DataFrame(
+        {
+            "Column": df.columns,
+            "Non-null %": ((df.notna().sum() / max(len(df), 1)) * 100).round(2),
+            "Missing %": ((df.isna().sum() / max(len(df), 1)) * 100).round(2),
+        }
+    ).sort_values("Missing %", ascending=False)
+    safe_dataframe(completeness, height=420)
+
+with st.expander("Metric definitions used in this dashboard"):
+    st.markdown(
+        """
+        - **Completed milestones**: a student has a value greater than 0 in at least one `Term X Milestone Completed` column.
+        - **Didn’t start**: `Activities completed = 0`, `Tasks completed = 0`, no term milestone completed, no activation date, and no last active date.
+        - **Active in last 6 months**: `Date of activation` is present and `Last active date` falls within the last 180 days from today.
+        - **Did semester/term 1 but not active in 2**: `Term 1 Milestone Completed > 0`, `Term 2 Milestone Completed = 0`, and not active in the last 6 months.
+        - **Faculty not assigned**: `Faculty Name` is blank or marked as `N/A`, `NA`, or similar.
+        - **GitHub persistence**: if configured in Streamlit secrets, the uploaded file can be saved to GitHub and used automatically on later app loads until another file is uploaded and saved.
+        """
+    )
