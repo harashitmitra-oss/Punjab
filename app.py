@@ -126,23 +126,48 @@ def parse_bytes_to_df(file_bytes: bytes, file_name: str) -> pd.DataFrame:
 
 
 @st.cache_data(show_spinner=False)
-def fetch_github_file(repo: str, branch: str, path: str, token: str) -> tuple[bytes, str]:
+import base64
+import requests
+
+def fetch_github_file(repo: str, branch: str, path: str, token: str):
     api_url = f"https://api.github.com/repos/{repo}/contents/{path}?ref={branch}"
-    headers = {
-        "Accept": "application/vnd.github+json",
+
+    base_headers = {
         "Authorization": f"Bearer {token}",
+        "Accept": "application/vnd.github.object+json",
         "X-GitHub-Api-Version": "2022-11-28",
     }
-    response = requests.get(api_url, headers=headers, timeout=30)
-    if response.status_code != 200:
-        raise RuntimeError(f"GitHub load failed: {response.status_code} {response.text[:200]}")
-    payload = response.json()
-    content = payload.get("content", "")
-    encoding = payload.get("encoding", "")
-    if encoding != "base64" or not content:
-        raise RuntimeError("GitHub file content was not returned as base64.")
-    return base64.b64decode(content), payload.get("sha", "")
 
+    resp = requests.get(api_url, headers=base_headers, timeout=30)
+    resp.raise_for_status()
+    payload = resp.json()
+
+    sha = payload.get("sha", "")
+    encoding = payload.get("encoding")
+    content = payload.get("content")
+
+
+    # Larger files: GitHub may return encoding="none" and no inline content
+    download_url = payload.get("download_url")
+    if download_url:
+        raw_resp = requests.get(download_url, timeout=60)
+        raw_resp.raise_for_status()
+        return raw_resp.content, sha
+
+    # Fallback: request raw content directly from the contents API
+    raw_headers = {
+        "Authorization": f"Bearer {token}",
+        "Accept": "application/vnd.github.raw+json",
+        "X-GitHub-Api-Version": "2022-11-28",
+    }
+    raw_resp = requests.get(api_url, headers=raw_headers, timeout=60)
+    raw_resp.raise_for_status()
+
+    # If GitHub returns raw bytes, use them
+    if raw_resp.content:
+        return raw_resp.content, sha
+
+    raise RuntimeError("Could not retrieve GitHub file content.")
 
 @st.cache_data(show_spinner=False)
 def load_local_file(path_str: str) -> tuple[pd.DataFrame, str]:
